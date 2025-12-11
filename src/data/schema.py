@@ -101,9 +101,8 @@ class FilterSample:
     w_ideal_S11_db: Any = None
     w_real_S11_db: Any = None
     # 输出
-    sfci_sequence: str = ""
-    sfci_tokens: Optional[List[str]] = None
-    sfci_tokens_net: Optional[List[str]] = None
+    vact_tokens: Optional[List[str]] = None  # component-centric VACT-Seq tokens
+    sfci_tokens: Optional[List[str]] = None  # net-centric SFCI tokens
     spec_id: Optional[int] = None
     circuit_id: Optional[int] = None
 
@@ -126,5 +125,6 @@ class FilterSample:
             "num_L": self.num_L,
             "num_C": self.num_C,
             "json_components": self.json_components,
-            "sfci_sequence": self.sfci_sequence,
+            "vact_tokens": self.vact_tokens or [],
+            "sfci_tokens": self.sfci_tokens or [],
         }

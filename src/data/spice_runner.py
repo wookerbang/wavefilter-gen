@@ -28,41 +28,88 @@ def run_ac_analysis_with_ngspice(
     f_stop = float(np.max(freq_hz))
     n_points = len(freq_hz)
 
-    netlist = circuit.to_spice_netlist()
-    lines = [netlist]
-    lines.append(f".ac lin {n_points} {f_start} {f_stop}")
-    lines.append(".control")
-    lines.append("set filetype=ascii")
-    lines.append("run")
-    lines.append("wrdata ac.csv frequency v(in) v(out)")
-    lines.append("quit")
-    lines.append(".endc")
-    lines.append(".end")
-
     with tempfile.TemporaryDirectory() as tmpdir:
         net_path = os.path.join(tmpdir, "circuit.sp")
         log_path = os.path.join(tmpdir, "ngspice.log")
         csv_path = os.path.join(tmpdir, "ac.csv")
+        netlist = circuit.to_spice_netlist()
+        lines = [netlist]
+        # 使用对数扫描与上游 logspace 频网更匹配
+        decades = max(1, np.ceil(np.log10(f_stop / f_start)))
+        points_per_dec = max(1, int(np.ceil(n_points / decades)))
+        if points_per_dec <= 0:
+            raise RuntimeError("Invalid points_per_dec computed for AC analysis.")
+        lines.append(f".ac dec {points_per_dec} {f_start} {f_stop}")
+        lines.append(".control")
+        lines.append("set filetype=ascii")
+        lines.append("run")
+        lines.append('wrdata "ac.csv" frequency v(in) v(out)')
+        lines.append("quit")
+        lines.append(".endc")
+        lines.append(".end")
         with open(net_path, "w") as f:
             f.write("\n".join(lines))
 
         cmd = ["ngspice", "-b", "-o", log_path, net_path]
         try:
-            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=tmpdir)
         except FileNotFoundError as exc:
             raise RuntimeError("ngspice not found in PATH") from exc
         except subprocess.CalledProcessError as exc:
-            raise RuntimeError(f"ngspice failed, see log at {log_path}") from exc
+            log_preview = ""
+            if os.path.exists(log_path):
+                try:
+                    with open(log_path, "r") as lf:
+                        log_preview = "".join(lf.readlines()[:50])
+                except Exception:
+                    log_preview = ""
+            raise RuntimeError(f"ngspice failed, see log at {log_path}\n{log_preview}") from exc
 
         if not os.path.exists(csv_path):
             raise RuntimeError("ngspice did not produce ac.csv")
 
-        data = np.genfromtxt(csv_path, delimiter="\t", names=True)
-        freq = np.array(data["frequency"])
-        v_in = np.array(data["v_in"])
-        v_out = np.array(data["v_out"])
+        try:
+            data = np.genfromtxt(csv_path, delimiter=None, comments="*;", dtype=float)
+        except Exception as exc:
+            log_preview = ""
+            if os.path.exists(log_path):
+                try:
+                    with open(log_path, "r") as lf:
+                        log_preview = "".join(lf.readlines()[:50])
+                except Exception:
+                    log_preview = ""
+            raise RuntimeError(f"Failed to read ac.csv: {exc}\n{log_preview}") from exc
+
+        # 若 genfromtxt 读到空数组，尝试过滤非数字行重读
+        if data.size == 0:
+            numeric_lines = []
+            with open(csv_path, "r") as cf:
+                for line in cf:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line[0].isdigit() or line[0] in "+-.":
+                        numeric_lines.append(line)
+            if numeric_lines:
+                data = np.genfromtxt(numeric_lines, delimiter=None, dtype=float)
+
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+    if data.shape[1] < 5:
+        raise RuntimeError("Unexpected ac.csv format from ngspice")
+
+    freq_sim = data[:, 0]
+    v_in = data[:, 1] + 1j * data[:, 2]
+    v_out = data[:, 3] + 1j * data[:, 4]
 
     H = v_out / (v_in + 1e-18)
+    # 若频率网格与请求不一致，插值到目标频轴
+    if len(freq_sim) != len(freq_hz) or not np.allclose(freq_sim, freq_hz):
+        # 确保单调递增
+        order = np.argsort(freq_sim)
+        freq_sim_sorted = freq_sim[order]
+        H_sorted = H[order]
+        H = np.interp(freq_hz, freq_sim_sorted, H_sorted.real) + 1j * np.interp(freq_hz, freq_sim_sorted, H_sorted.imag)
     s21_db = 20.0 * np.log10(np.abs(H) + 1e-12)
     s11_db = np.zeros_like(s21_db)
     return s21_db, s11_db

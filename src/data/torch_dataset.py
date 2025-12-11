@@ -47,7 +47,7 @@ class FilterDesignDataset(Dataset):
         type_id = 0 if s["filter_type"] == "lowpass" else 1
         scalar = torch.tensor([type_id, s["fc_hz"]], dtype=torch.float32)
 
-        sfci_tokens = s.get("sfci_tokens") or s.get("sfci_sequence", "").split()
+        sfci_tokens = s.get("vact_tokens") or s.get("sfci_tokens") or []
         if hasattr(self.tokenizer, "encode"):
             token_ids = self.tokenizer.encode(sfci_tokens)
         else:

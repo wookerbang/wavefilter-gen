@@ -18,8 +18,8 @@ from .gen_prototype import (
 )
 from .quantization import quantize_components
 from .schema import ComponentSpec, FilterSample
-from .sfci_codec import components_to_sfci
-from .sfci_codec_netcentric import components_to_netcentric
+from .vact_codec import components_to_vact_tokens
+from .sfci_net_codec import components_to_sfci_net_tokens
 from .spice_runner import simulate_real_waveform
 
 
@@ -38,8 +38,8 @@ def _serialize_sample(sample: FilterSample) -> dict:
             "real_s11_db": np.asarray(sample.w_real_S11_db, dtype=float).tolist() if sample.w_real_S11_db is not None else None,
             "ideal_components": _serialize_components(sample.ideal_components or []),
             "discrete_components": _serialize_components(sample.discrete_components or []),
+            "vact_tokens": sample.vact_tokens or [],
             "sfci_tokens": sample.sfci_tokens or [],
-            "sfci_tokens_net": sample.sfci_tokens_net or [],
         }
     )
     return data
@@ -92,8 +92,8 @@ def build_dataset(
                 print(f"Sample {i}: Circuit broken (High insertion loss).")
                 continue
 
-            sfci_tokens = [f"<ORDER_{spec['order']}>", "<SEP>"] + components_to_sfci(discrete_components)
-            sfci_tokens_net = components_to_netcentric(discrete_components)
+            vact_tokens = [f"<ORDER_{spec['order']}>", "<SEP>"] + components_to_vact_tokens(discrete_components)
+            sfci_tokens = components_to_sfci_net_tokens(discrete_components)
             sample = FilterSample(
                 spec_id=i,
                 circuit_id=i,
@@ -115,9 +115,8 @@ def build_dataset(
                 w_real_S21_db=real_s21_db,
                 w_ideal_S11_db=ideal_s11_db,
                 w_real_S11_db=real_s11_db,
-                sfci_sequence=" ".join(sfci_tokens),
+                vact_tokens=vact_tokens,
                 sfci_tokens=sfci_tokens,
-                sfci_tokens_net=sfci_tokens_net,
             )
 
             f.write(json.dumps(_serialize_sample(sample)) + "\n")

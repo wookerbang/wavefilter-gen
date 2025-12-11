@@ -27,7 +27,7 @@ def _node_order(node: str) -> int:
     return 30_000
 
 
-def components_to_netcentric(components: List[ComponentSpec]) -> List[str]:
+def components_to_sfci_net_tokens(components: List[ComponentSpec]) -> List[str]:
     """
     Net-centric SFCI-like encoding:
       <NODE_x> (<DEV_L0> <ROLE_SERIES> <VAL_label> <PEER_y>)* <ENDNODE>
@@ -65,7 +65,7 @@ def components_to_netcentric(components: List[ComponentSpec]) -> List[str]:
     return tokens
 
 
-def netcentric_to_components(tokens: List[str], label_to_value: Mapping[str, float] | None = None) -> List[ComponentSpec]:
+def sfci_net_tokens_to_components(tokens: List[str], label_to_value: Mapping[str, float] | None = None) -> List[ComponentSpec]:
     """
     Decode net-centric tokens back to components.
     Components are reconstructed once per undirected pair (node, peer, ctype, id).
@@ -126,7 +126,7 @@ def netcentric_to_components(tokens: List[str], label_to_value: Mapping[str, flo
     return comps
 
 
-def build_netcentric_vocab(
+def build_sfci_net_vocab(
     value_labels: Sequence[str],
     max_id_per_type: Mapping[str, int] = {"L": 16, "C": 16},
     node_names: Sequence[str] = ("in", "out", "gnd") + tuple(f"n{k}" for k in range(16)),
