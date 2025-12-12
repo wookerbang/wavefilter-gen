@@ -16,7 +16,8 @@ class FilterDesignDataset(Dataset):
         self,
         jsonl_path: str,
         tokenizer,
-        use_wave: Literal["ideal", "real", "both"] = "real",
+        use_wave: Literal["ideal", "real", "both", "ideal_s21", "real_s21", "mix"] = "real",
+        mix_real_prob: float = 0.3,
     ):
         self.samples = []
         with open(jsonl_path, "r") as f:
@@ -24,6 +25,7 @@ class FilterDesignDataset(Dataset):
                 self.samples.append(json.loads(line))
         self.tokenizer = tokenizer
         self.use_wave = use_wave
+        self.mix_real_prob = mix_real_prob
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -37,10 +39,18 @@ class FilterDesignDataset(Dataset):
         real_s21 = torch.tensor(s["real_s21_db"], dtype=torch.float32)
         real_s11 = torch.tensor(s["real_s11_db"], dtype=torch.float32)
 
-        if self.use_wave == "ideal":
+        mode = self.use_wave
+        if mode == "mix":
+            mode = "real" if torch.rand(1).item() < self.mix_real_prob else "ideal"
+
+        if mode == "ideal":
             wave = torch.stack([ideal_s21, ideal_s11], dim=0)
-        elif self.use_wave == "real":
+        elif mode == "real":
             wave = torch.stack([real_s21, real_s11], dim=0)
+        elif mode == "ideal_s21":
+            wave = ideal_s21.unsqueeze(0)
+        elif mode == "real_s21":
+            wave = real_s21.unsqueeze(0)
         else:
             wave = torch.stack([ideal_s21, ideal_s11, real_s21, real_s11], dim=0)
 

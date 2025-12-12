@@ -23,9 +23,12 @@ class VACTT5(nn.Module):
         value_token_to_value: Optional[Mapping[int, float]] = None,
         waveform_in_channels: int = 1,
         d_model_override: Optional[int] = None,
+        vocab_size: Optional[int] = None,
     ):
         super().__init__()
         self.t5 = T5ForConditionalGeneration.from_pretrained(t5_name)
+        if vocab_size is not None:
+            self.t5.resize_token_embeddings(vocab_size)
         d_model = d_model_override or self.t5.config.d_model
 
         self.wave_encoder = MultiScaleWaveformEncoder(d_model=d_model, in_channels=waveform_in_channels)
@@ -43,7 +46,7 @@ class VACTT5(nn.Module):
             filter_type: (B,) long tensor 0/1
             fc_hz: (B,) float tensor of cutoff freq in Hz
         """
-        log_fc = torch.log10(fc_hz)
+        log_fc = torch.log10(fc_hz.clamp_min(1e-6))
         spec_tok = self.spec_encoder(filter_type, log_fc).unsqueeze(1)  # (B,1,d)
         wave_feat = self.wave_encoder(wave)  # (B,Lw,d)
         enc = torch.cat([spec_tok, wave_feat], dim=1)

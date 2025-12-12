@@ -28,6 +28,7 @@ def build_value_map(tokenizer) -> Dict[int, float]:
 
 def make_collate_fn(tokenizer, use_repr: str):
     pad_id = tokenizer.pad_token_id
+    eos_id = tokenizer.eos_token_id
 
     def collate(batch: list[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         waves = torch.stack([b["wave"] for b in batch])  # (B, C, L)
@@ -35,8 +36,13 @@ def make_collate_fn(tokenizer, use_repr: str):
         filter_type = scalars[:, 0].long()
         fc_hz = scalars[:, 1]
 
-        # dataset 提供的是 input_ids；如未来传入原始 tokens，可在此按 repr 选择
-        seqs = [b.get("input_ids") or b.get("vact_tokens") or b.get("sfci_tokens") for b in batch]
+        tokens_key = "vact_tokens" if use_repr == "vact" else "sfci_tokens"
+        seqs = []
+        for b in batch:
+            seq = list(b.get(tokens_key) or b.get("input_ids"))
+            if not seq or seq[-1] != eos_id:
+                seq.append(eos_id)
+            seqs.append(seq)
         max_len = max(len(s) for s in seqs)
         input_ids = torch.full((len(batch), max_len), pad_id, dtype=torch.long)
         for i, seq in enumerate(seqs):
@@ -79,7 +85,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
     p.add_argument("--log-steps", type=int, default=50, help="Logging steps.")
     p.add_argument("--save-steps", type=int, default=500, help="Checkpoint save steps.")
-    p.add_argument("--use-wave", choices=["ideal", "real", "both"], default="real", help="Which waveform to use.")
+    p.add_argument(
+        "--use-wave",
+        choices=["ideal", "real", "both", "ideal_s21", "real_s21", "mix"],
+        default="real",
+        help="Which waveform to use (S21-only options: ideal_s21 / real_s21).",
+    )
+    p.add_argument(
+        "--mix-real-prob",
+        type=float,
+        default=0.3,
+        help="When --use-wave mix, probability of picking real waveform (rest ideal).",
+    )
     p.add_argument("--repr", choices=["vact", "sfci"], default="vact", help="Which token sequence to train on.")
     return p.parse_args()
 
@@ -92,7 +109,12 @@ def main() -> None:
 
     value_map = build_value_map(tokenizer)
 
-    train_ds = FilterDesignDataset(str(args.data), tokenizer, use_wave=args.use_wave)
+    train_ds = FilterDesignDataset(
+        str(args.data),
+        tokenizer,
+        use_wave=args.use_wave,
+        mix_real_prob=args.mix_real_prob,
+    )
     collate_fn = make_collate_fn(tokenizer, use_repr=args.repr)
 
     sample_wave = train_ds[0]["wave"]
@@ -101,6 +123,7 @@ def main() -> None:
         t5_name=args.t5_name,
         value_token_to_value=value_map,
         waveform_in_channels=in_channels,
+        vocab_size=len(tokenizer),
     )
     model.t5.config.eos_token_id = tokenizer.eos_token_id
     model.t5.config.pad_token_id = tokenizer.pad_token_id
@@ -115,6 +138,9 @@ def main() -> None:
         save_steps=args.save_steps,
         remove_unused_columns=False,
         report_to="none",
+        warmup_ratio=0.05,
+        weight_decay=0.01,
+        max_grad_norm=1.0,
     )
 
     trainer = Wave2CircuitTrainer(
