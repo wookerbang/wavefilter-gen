@@ -6,9 +6,9 @@ import torch
 import torch.nn as nn
 
 
-class ParallelMultiScaleWaveformEncoder(nn.Module):
+class MultiScaleWaveformEncoder(nn.Module):
     """
-    真正的多尺度并行编码器：小核支路捕捉纹波，大核支路捕捉趋势。
+    多尺度并行编码器：小核支路捕捉纹波，大核支路捕捉趋势。
     输入默认 (B, 1, 256)，输出约 (B, 64, d_model)。
     """
 
@@ -58,7 +58,3 @@ class ParallelMultiScaleWaveformEncoder(nn.Module):
         out = self.fusion(concat)
         pe = self._positional_encoding(out.size(1), out.size(2), out.device)
         return self.dropout(out + pe.unsqueeze(0))
-
-
-# 向后兼容原类名
-MultiScaleWaveformEncoder = ParallelMultiScaleWaveformEncoder

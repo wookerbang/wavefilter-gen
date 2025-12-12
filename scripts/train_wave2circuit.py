@@ -5,12 +5,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 import torch
-from torch.utils.data import DataLoader
-from transformers import (
-    AutoTokenizer,
-    Trainer,
-    TrainingArguments,
-)
+from transformers import AutoTokenizer, Trainer, TrainingArguments
 
 from src.data.torch_dataset import FilterDesignDataset
 from src.data import quantization
@@ -27,12 +22,11 @@ def build_value_map(tokenizer) -> Dict[int, float]:
             try:
                 mapping[tid] = float(quantization.label_to_value(label))
             except Exception:
-                # skip tokens that cannot be parsed
                 continue
     return mapping
 
 
-def make_collate_fn(tokenizer):
+def make_collate_fn(tokenizer, use_repr: str):
     pad_id = tokenizer.pad_token_id
 
     def collate(batch: list[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
@@ -41,12 +35,15 @@ def make_collate_fn(tokenizer):
         filter_type = scalars[:, 0].long()
         fc_hz = scalars[:, 1]
 
-        max_len = max(len(b["input_ids"]) for b in batch)
+        # dataset 提供的是 input_ids；如未来传入原始 tokens，可在此按 repr 选择
+        seqs = [b.get("input_ids") or b.get("vact_tokens") or b.get("sfci_tokens") for b in batch]
+        max_len = max(len(s) for s in seqs)
         input_ids = torch.full((len(batch), max_len), pad_id, dtype=torch.long)
-        for i, b in enumerate(batch):
-            l = len(b["input_ids"])
-            input_ids[i, :l] = b["input_ids"]
+        for i, seq in enumerate(seqs):
+            l = len(seq)
+            input_ids[i, :l] = torch.tensor(seq, dtype=torch.long)
         labels = input_ids.clone()
+        labels[labels == pad_id] = -100  # ignore pad in loss
         return {
             "wave": waves,
             "filter_type": filter_type,
@@ -57,7 +54,9 @@ def make_collate_fn(tokenizer):
     return collate
 
 
-class VACTTrainer(Trainer):
+class Wave2CircuitTrainer(Trainer):
+    """Custom Trainer that routes waveform/spec inputs into VACTT5."""
+
     def compute_loss(self, model, inputs, return_outputs=False):
         outputs = model(
             wave=inputs["wave"],
@@ -70,10 +69,10 @@ class VACTTrainer(Trainer):
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train VACT-T5 on LC filter dataset.")
+    p = argparse.ArgumentParser(description="Train waveform-conditioned circuit generator (VACT or SFCI).")
     p.add_argument("--data", type=Path, required=True, help="Path to train jsonl.")
     p.add_argument("--tokenizer", type=str, required=True, help="Path or name of tokenizer.")
-    p.add_argument("--output", type=Path, default=Path("checkpoints/vact_t5"), help="Checkpoint dir.")
+    p.add_argument("--output", type=Path, default=Path("checkpoints/wave2circuit"), help="Checkpoint dir.")
     p.add_argument("--t5-name", type=str, default="t5-small", help="HF model name, e.g., t5-small or t5-base.")
     p.add_argument("--batch-size", type=int, default=8, help="Per-device batch size.")
     p.add_argument("--epochs", type=int, default=5, help="Number of epochs.")
@@ -81,6 +80,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-steps", type=int, default=50, help="Logging steps.")
     p.add_argument("--save-steps", type=int, default=500, help="Checkpoint save steps.")
     p.add_argument("--use-wave", choices=["ideal", "real", "both"], default="real", help="Which waveform to use.")
+    p.add_argument("--repr", choices=["vact", "sfci"], default="vact", help="Which token sequence to train on.")
     return p.parse_args()
 
 
@@ -93,13 +93,18 @@ def main() -> None:
     value_map = build_value_map(tokenizer)
 
     train_ds = FilterDesignDataset(str(args.data), tokenizer, use_wave=args.use_wave)
-    collate_fn = make_collate_fn(tokenizer)
+    collate_fn = make_collate_fn(tokenizer, use_repr=args.repr)
 
+    sample_wave = train_ds[0]["wave"]
+    in_channels = sample_wave.shape[0]
     model = VACTT5(
         t5_name=args.t5_name,
         value_token_to_value=value_map,
-        waveform_in_channels=2 if args.use_wave in {"ideal", "real"} else 4,
+        waveform_in_channels=in_channels,
     )
+    model.t5.config.eos_token_id = tokenizer.eos_token_id
+    model.t5.config.pad_token_id = tokenizer.pad_token_id
+    model.t5.config.decoder_start_token_id = tokenizer.pad_token_id
 
     training_args = TrainingArguments(
         output_dir=str(args.output),
@@ -112,7 +117,7 @@ def main() -> None:
         report_to="none",
     )
 
-    trainer = VACTTrainer(
+    trainer = Wave2CircuitTrainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,

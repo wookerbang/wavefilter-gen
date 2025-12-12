@@ -22,10 +22,14 @@ class ValueAwareEmbedding(nn.Module):
         self.base_embedding = base_embedding
         vocab_size, d_model = base_embedding.weight.shape
         lookup = torch.zeros(vocab_size)
+        is_value = torch.zeros(vocab_size, dtype=torch.bool)
         for tid, v in token_to_value.items():
-            if 0 <= int(tid) < vocab_size:
-                lookup[int(tid)] = float(v)
+            idx = int(tid)
+            if 0 <= idx < vocab_size:
+                lookup[idx] = float(v)
+                is_value[idx] = True
         self.register_buffer("value_lookup", lookup, persistent=False)
+        self.register_buffer("is_value_token", is_value, persistent=False)
         self.mlp = nn.Sequential(
             nn.Linear(1, hidden_dim),
             nn.ReLU(),
@@ -38,10 +42,10 @@ class ValueAwareEmbedding(nn.Module):
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         base = self.base_embedding(input_ids)
-        vals = self.value_lookup[input_ids]  # (B, T)
-        mask = vals != 0
+        mask = self.is_value_token[input_ids]
         if mask.any():
-            val_vec = self.mlp(torch.log(vals[mask].unsqueeze(-1) + 1e-16))
+            vals = self.value_lookup[input_ids][mask]
+            val_vec = self.mlp(torch.log10(vals.unsqueeze(-1).clamp_min(1e-16)))
             offset = torch.zeros_like(base)
             offset[mask] = val_vec
             return base + offset
