@@ -1,3 +1,40 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual envs
+venv/
+env/
+
+# OS files
+.DS_Store
+
+# VSCode
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Build / distribution
+dist/
+build/
+
+# Large data, models and artifacts (skip upload)
+checkpoints/
+data/
+artifacts/
+
+# Model weights and checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Tokenizers and large binaries
+*.jsonl
+
+# Ignore generated plots and temp files
+*.png
 __pycache__/
 *.pyc
 data/processed/v1/
