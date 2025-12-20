@@ -2,35 +2,50 @@ from __future__ import annotations
 
 import argparse
 import random
+import sys
 from pathlib import Path
 from typing import Any, Dict
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from transformers import AutoTokenizer, Trainer, TrainingArguments
+
+# Ensure project root on path
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from src.data.torch_dataset import FilterDesignDataset
 from src.data import quantization
+from src.data.vact_codec import CELL_TOKEN, ORDER_PREFIX, SEP_TOKEN
+from src.data.dsl_codec import (
+    CIRCUIT_END,
+    CIRCUIT_START,
+    CELL_END,
+    PORT_IN,
+    PORT_OUT,
+    SERIES_BLOCK_END,
+    SERIES_BLOCK_START,
+    SHUNT_BLOCK_END,
+    SHUNT_BLOCK_START,
+    Z0_50,
+)
+from src.data.dsl_v2 import VALUE_SLOTS, make_dslv2_prefix_allowed_tokens_fn
 from src.models import VACTT5
-
-
-def build_value_map(tokenizer) -> Dict[int, float]:
-    """Map value tokens to numeric SI values for value-aware embedding."""
-    vocab = tokenizer.get_vocab()
-    mapping: Dict[int, float] = {}
-    for tok, tid in vocab.items():
-        if tok.startswith("<VAL_"):
-            label = tok.replace("<VAL_", "").replace(">", "")
-            try:
-                mapping[tid] = float(quantization.label_to_value(label))
-            except Exception:
-                continue
-    return mapping
 
 
 def make_collate_fn(tokenizer, use_repr: str):
     pad_id = tokenizer.pad_token_id
     eos_id = tokenizer.eos_token_id
+    vocab = tokenizer.get_vocab()
+    id_to_value = [float("nan")] * len(vocab)
+    for tok, tid in vocab.items():
+        if tok.startswith("<VAL_"):
+            try:
+                id_to_value[int(tid)] = float(quantization.label_to_value(tok.replace("<VAL_", "").replace(">", "")))
+            except Exception:
+                continue
 
     def collate(batch: list[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         waves = torch.stack([b["wave"] for b in batch])  # (B, C, L)
@@ -38,18 +53,34 @@ def make_collate_fn(tokenizer, use_repr: str):
         filter_type = scalars[:, 0].long()
         fc_hz = scalars[:, 1]
 
-        tokens_key = "vact_tokens" if use_repr == "vact" else "sfci_tokens"
+        if use_repr == "vact":
+            tokens_key = "vact_tokens"
+        elif use_repr == "vactdsl":
+            tokens_key = "vactdsl_tokens"
+        else:
+            tokens_key = "sfci_tokens"
         seqs = []
+        value_lists = []
         for b in batch:
             seq = list(b.get(tokens_key) or b.get("input_ids"))
             if not seq or seq[-1] != eos_id:
                 seq.append(eos_id)
             seqs.append(seq)
+            value_lists.append(b.get("value_targets"))
         max_len = max(len(s) for s in seqs)
         input_ids = torch.full((len(batch), max_len), pad_id, dtype=torch.long)
+        value_targets = torch.full((len(batch), max_len), float("nan"), dtype=torch.float32)
         for i, seq in enumerate(seqs):
             l = len(seq)
             input_ids[i, :l] = torch.tensor(seq, dtype=torch.long)
+            vt_list = value_lists[i] if value_lists[i] is not None else None
+            for t, tid in enumerate(seq):
+                if t >= max_len:
+                    break
+                if vt_list is not None and t < len(vt_list) and vt_list[t] == vt_list[t]:
+                    value_targets[i, t] = float(vt_list[t])
+                elif 0 <= tid < len(id_to_value) and not (id_to_value[tid] != id_to_value[tid]):
+                    value_targets[i, t] = float(id_to_value[tid])
         labels = input_ids.clone()
         labels[labels == pad_id] = -100  # ignore pad in loss
         return {
@@ -57,13 +88,384 @@ def make_collate_fn(tokenizer, use_repr: str):
             "filter_type": filter_type,
             "fc_hz": fc_hz,
             "labels": labels,
+            "value_targets": value_targets,
         }
 
     return collate
 
 
+def _shift_right(labels: torch.Tensor, pad_id: int) -> torch.Tensor:
+    """
+    Minimal T5-style shift_right used for constrained train-time masking.
+    """
+    decoder_input_ids = labels.new_full(labels.shape, pad_id)
+    decoder_input_ids[:, 1:] = labels[:, :-1]
+    decoder_input_ids[:, 0] = pad_id
+    decoder_input_ids = decoder_input_ids.masked_fill(decoder_input_ids == -100, pad_id)
+    return decoder_input_ids
+
+
+def build_train_time_grammar_masker(tokenizer, *, repr_kind: str):
+    """
+    Returns a function:
+      mask_logits(logits, labels) -> masked_logits
+    where logits are masked according to the grammar induced by repr_kind.
+    """
+    vocab = tokenizer.get_vocab()
+    vocab_size = len(vocab)
+    special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+    pad_id = int(tokenizer.pad_token_id)
+    eos_id = int(tokenizer.eos_token_id) if tokenizer.eos_token_id is not None else None
+
+    type_ids = {vocab[tok] for tok in ("<L>", "<C>") if tok in vocab}
+    val_ids = {tid for tok, tid in vocab.items() if tok.startswith("<VAL_")}
+    node_ids = {tid for tok, tid in vocab.items() if tok.startswith("<NODE_")}
+    order_ids = {tid for tok, tid in vocab.items() if tok.startswith(ORDER_PREFIX)}
+    sep_id = vocab.get(SEP_TOKEN)
+
+    role_series_id = vocab.get("<SERIES>")
+    role_shunt_id = vocab.get("<SHUNT>")
+    role_ids = {x for x in (role_series_id, role_shunt_id) if x is not None}
+
+    def _mask_vact(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        dec_in = _shift_right(labels, pad_id)
+        masked = logits.clone()
+        B, L, V = masked.shape
+        if V != vocab_size:
+            # tokenizer/model vocab mismatch; fail open
+            return masked
+        for b in range(B):
+            state = 0  # 0:type,1:role,2:val,3:n1,4:n2
+            started = False
+            for t in range(L):
+                tid_prev = int(dec_in[b, t].item())
+                if tid_prev in special_ids:
+                    pass
+                else:
+                    if state == 0:
+                        if not started and tid_prev in order_ids:
+                            pass
+                        elif not started and sep_id is not None and tid_prev == sep_id:
+                            pass
+                        elif tid_prev == vocab.get(CELL_TOKEN):
+                            pass
+                        elif tid_prev in type_ids:
+                            state = 1
+                            started = True
+                        else:
+                            # invalid prefix -> stop masking (fail open for remaining positions)
+                            break
+                    elif state == 1:
+                        if tid_prev in role_ids:
+                            state = 2
+                        else:
+                            break
+                    elif state == 2:
+                        if tid_prev in val_ids:
+                            state = 3
+                        else:
+                            break
+                    elif state == 3:
+                        if tid_prev in node_ids:
+                            state = 4
+                        else:
+                            break
+                    elif state == 4:
+                        if tid_prev in node_ids:
+                            state = 0
+                        else:
+                            break
+
+                if int(labels[b, t].item()) == -100:
+                    continue
+
+                allowed: List[int] = []
+                if state == 0:
+                    allowed = list(type_ids)
+                    cell = vocab.get(CELL_TOKEN)
+                    if cell is not None:
+                        allowed.append(cell)
+                    if not started:
+                        allowed.extend(list(order_ids))
+                        if sep_id is not None:
+                            allowed.append(int(sep_id))
+                    if eos_id is not None:
+                        allowed.append(eos_id)
+                elif state == 1:
+                    allowed = list(role_ids)
+                elif state == 2:
+                    allowed = list(val_ids)
+                else:
+                    allowed = list(node_ids)
+
+                allowed.append(pad_id)
+                allow = torch.tensor(sorted(set(allowed)), dtype=torch.long, device=masked.device)
+                dis = torch.ones((V,), dtype=torch.bool, device=masked.device)
+                dis[allow] = False
+                masked[b, t, dis] = -1e9
+        return masked
+
+    def _mask_vactdsl(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        dec_in = _shift_right(labels, pad_id)
+        masked = logits.clone()
+        B, L, V = masked.shape
+        if V != vocab_size:
+            return masked
+
+        # resolve structure token IDs once
+        ids = {k: vocab.get(k) for k in [CIRCUIT_START, CIRCUIT_END, CELL_TOKEN, CELL_END, SERIES_BLOCK_START, SERIES_BLOCK_END, SHUNT_BLOCK_START, SHUNT_BLOCK_END, PORT_IN, PORT_OUT, Z0_50]}
+        required = ["<CIRCUIT>", "</CIRCUIT>", "<CELL>", "</CELL>", "<SERIES_BLOCK>", "</SERIES_BLOCK>", "<SHUNT_BLOCK>", "</SHUNT_BLOCK>"]
+        if any(ids.get(k) is None for k in required):
+            return masked
+
+        S_START = 0
+        S_AFTER_CIRCUIT = 1
+        S_AFTER_PORT_IN = 2
+        S_AFTER_NODE_IN = 3
+        S_AFTER_PORT_OUT = 4
+        S_AFTER_NODE_OUT = 5
+        S_BODY = 6
+        S_AFTER_CELL = 7
+        S_IN_SERIES_EXPECT_TYPE_OR_END = 8
+        S_IN_SERIES_EXPECT_ROLE = 9
+        S_IN_SERIES_EXPECT_VAL = 10
+        S_IN_SERIES_EXPECT_N1 = 11
+        S_IN_SERIES_EXPECT_N2 = 12
+        S_AFTER_SERIES_END = 13
+        S_IN_SHUNT_EXPECT_TYPE_OR_END = 14
+        S_IN_SHUNT_EXPECT_ROLE = 15
+        S_IN_SHUNT_EXPECT_VAL = 16
+        S_IN_SHUNT_EXPECT_N1 = 17
+        S_IN_SHUNT_EXPECT_N2 = 18
+        S_AFTER_SHUNT_END = 19
+        S_DONE = 20
+
+        node_in_id = vocab.get("<NODE_in>")
+        node_out_id = vocab.get("<NODE_out>")
+
+        for b in range(B):
+            state = S_START
+            for t in range(L):
+                tid_prev = int(dec_in[b, t].item())
+                if tid_prev not in special_ids:
+                    if state == S_START:
+                        if tid_prev in order_ids:
+                            pass
+                        elif sep_id is not None and tid_prev == sep_id:
+                            pass
+                        elif tid_prev == ids[CIRCUIT_START]:
+                            state = S_AFTER_CIRCUIT
+                        else:
+                            break
+                    elif state == S_AFTER_CIRCUIT:
+                        if tid_prev == ids[PORT_IN]:
+                            state = S_AFTER_PORT_IN
+                        elif tid_prev == ids[Z0_50]:
+                            state = S_BODY
+                        elif tid_prev == ids[CELL_TOKEN]:
+                            state = S_AFTER_CELL
+                        elif tid_prev == ids[CIRCUIT_END]:
+                            state = S_DONE
+                        else:
+                            break
+                    elif state == S_AFTER_PORT_IN:
+                        if node_in_id is not None and tid_prev == node_in_id:
+                            state = S_AFTER_NODE_IN
+                        else:
+                            break
+                    elif state == S_AFTER_NODE_IN:
+                        if tid_prev == ids[PORT_OUT]:
+                            state = S_AFTER_PORT_OUT
+                        else:
+                            break
+                    elif state == S_AFTER_PORT_OUT:
+                        if node_out_id is not None and tid_prev == node_out_id:
+                            state = S_AFTER_NODE_OUT
+                        else:
+                            break
+                    elif state == S_AFTER_NODE_OUT:
+                        if tid_prev == ids[Z0_50]:
+                            state = S_BODY
+                        elif tid_prev == ids[CELL_TOKEN]:
+                            state = S_AFTER_CELL
+                        elif tid_prev == ids[CIRCUIT_END]:
+                            state = S_DONE
+                        else:
+                            break
+                    elif state == S_BODY:
+                        if tid_prev == ids[CELL_TOKEN]:
+                            state = S_AFTER_CELL
+                        elif tid_prev == ids[CIRCUIT_END]:
+                            state = S_DONE
+                        else:
+                            break
+                    elif state == S_AFTER_CELL:
+                        if tid_prev == ids[SERIES_BLOCK_START]:
+                            state = S_IN_SERIES_EXPECT_TYPE_OR_END
+                        else:
+                            break
+                    elif state == S_IN_SERIES_EXPECT_TYPE_OR_END:
+                        if tid_prev in type_ids:
+                            state = S_IN_SERIES_EXPECT_ROLE
+                        elif tid_prev == ids[SERIES_BLOCK_END]:
+                            state = S_AFTER_SERIES_END
+                        else:
+                            break
+                    elif state == S_IN_SERIES_EXPECT_ROLE:
+                        if role_series_id is not None and tid_prev == role_series_id:
+                            state = S_IN_SERIES_EXPECT_VAL
+                        else:
+                            break
+                    elif state == S_IN_SERIES_EXPECT_VAL:
+                        if tid_prev in val_ids:
+                            state = S_IN_SERIES_EXPECT_N1
+                        else:
+                            break
+                    elif state == S_IN_SERIES_EXPECT_N1:
+                        if tid_prev in node_ids:
+                            state = S_IN_SERIES_EXPECT_N2
+                        else:
+                            break
+                    elif state == S_IN_SERIES_EXPECT_N2:
+                        if tid_prev in node_ids:
+                            state = S_IN_SERIES_EXPECT_TYPE_OR_END
+                        else:
+                            break
+                    elif state == S_AFTER_SERIES_END:
+                        if tid_prev == ids[SHUNT_BLOCK_START]:
+                            state = S_IN_SHUNT_EXPECT_TYPE_OR_END
+                        else:
+                            break
+                    elif state == S_IN_SHUNT_EXPECT_TYPE_OR_END:
+                        if tid_prev in type_ids:
+                            state = S_IN_SHUNT_EXPECT_ROLE
+                        elif tid_prev == ids[SHUNT_BLOCK_END]:
+                            state = S_AFTER_SHUNT_END
+                        else:
+                            break
+                    elif state == S_IN_SHUNT_EXPECT_ROLE:
+                        if role_shunt_id is not None and tid_prev == role_shunt_id:
+                            state = S_IN_SHUNT_EXPECT_VAL
+                        else:
+                            break
+                    elif state == S_IN_SHUNT_EXPECT_VAL:
+                        if tid_prev in val_ids:
+                            state = S_IN_SHUNT_EXPECT_N1
+                        else:
+                            break
+                    elif state == S_IN_SHUNT_EXPECT_N1:
+                        if tid_prev in node_ids:
+                            state = S_IN_SHUNT_EXPECT_N2
+                        else:
+                            break
+                    elif state == S_IN_SHUNT_EXPECT_N2:
+                        if tid_prev in node_ids:
+                            state = S_IN_SHUNT_EXPECT_TYPE_OR_END
+                        else:
+                            break
+                    elif state == S_AFTER_SHUNT_END:
+                        if tid_prev == ids[CELL_END]:
+                            state = S_BODY
+                        else:
+                            break
+                    elif state == S_DONE:
+                        pass
+
+                if int(labels[b, t].item()) == -100:
+                    continue
+
+                allowed: List[int] = []
+                if state == S_START:
+                    allowed.extend(list(order_ids))
+                    if sep_id is not None:
+                        allowed.append(int(sep_id))
+                    allowed.append(int(ids[CIRCUIT_START]))
+                elif state == S_AFTER_CIRCUIT:
+                    allowed.extend([int(ids[PORT_IN]), int(ids[CELL_TOKEN]), int(ids[CIRCUIT_END]), int(ids[Z0_50])])
+                elif state == S_AFTER_PORT_IN:
+                    if node_in_id is not None:
+                        allowed.append(int(node_in_id))
+                elif state == S_AFTER_NODE_IN:
+                    allowed.append(int(ids[PORT_OUT]))
+                elif state == S_AFTER_PORT_OUT:
+                    if node_out_id is not None:
+                        allowed.append(int(node_out_id))
+                elif state == S_AFTER_NODE_OUT:
+                    allowed.extend([int(ids[Z0_50]), int(ids[CELL_TOKEN]), int(ids[CIRCUIT_END])])
+                elif state == S_BODY:
+                    allowed.extend([int(ids[CELL_TOKEN]), int(ids[CIRCUIT_END])])
+                elif state == S_AFTER_CELL:
+                    allowed.append(int(ids[SERIES_BLOCK_START]))
+                elif state == S_IN_SERIES_EXPECT_TYPE_OR_END:
+                    allowed.extend(list(type_ids))
+                    allowed.append(int(ids[SERIES_BLOCK_END]))
+                elif state == S_IN_SERIES_EXPECT_ROLE:
+                    if role_series_id is not None:
+                        allowed.append(int(role_series_id))
+                elif state == S_IN_SERIES_EXPECT_VAL:
+                    allowed.extend(list(val_ids))
+                elif state in (S_IN_SERIES_EXPECT_N1, S_IN_SERIES_EXPECT_N2):
+                    allowed.extend(list(node_ids))
+                elif state == S_AFTER_SERIES_END:
+                    allowed.append(int(ids[SHUNT_BLOCK_START]))
+                elif state == S_IN_SHUNT_EXPECT_TYPE_OR_END:
+                    allowed.extend(list(type_ids))
+                    allowed.append(int(ids[SHUNT_BLOCK_END]))
+                elif state == S_IN_SHUNT_EXPECT_ROLE:
+                    if role_shunt_id is not None:
+                        allowed.append(int(role_shunt_id))
+                elif state == S_IN_SHUNT_EXPECT_VAL:
+                    allowed.extend(list(val_ids))
+                elif state in (S_IN_SHUNT_EXPECT_N1, S_IN_SHUNT_EXPECT_N2):
+                    allowed.extend(list(node_ids))
+                elif state == S_AFTER_SHUNT_END:
+                    allowed.append(int(ids[CELL_END]))
+                elif state == S_DONE:
+                    # do not constrain once closed
+                    continue
+
+                allowed.append(pad_id)
+                allow = torch.tensor(sorted(set(allowed)), dtype=torch.long, device=masked.device)
+                dis = torch.ones((V,), dtype=torch.bool, device=masked.device)
+                dis[allow] = False
+                masked[b, t, dis] = -1e9
+
+        return masked
+
+    if repr_kind == "vact":
+        return _mask_vact
+    if repr_kind == "vactdsl":
+        return _mask_vactdsl
+    if repr_kind == "dslv2":
+        prefix_allowed = make_dslv2_prefix_allowed_tokens_fn(tokenizer)
+
+        def _mask_dslv2(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+            dec_in = _shift_right(labels, pad_id)
+            masked = logits.clone()
+            B, L, V = masked.shape
+            if V != vocab_size:
+                return masked
+            for b in range(B):
+                for t in range(L):
+                    if int(labels[b, t].item()) == -100:
+                        continue
+                    allowed = prefix_allowed(b, dec_in[b, : t + 1])
+                    allow = torch.tensor(sorted(set(allowed)), dtype=torch.long, device=masked.device)
+                    dis = torch.ones((V,), dtype=torch.bool, device=masked.device)
+                    dis[allow] = False
+                    masked[b, t, dis] = -1e9
+            return masked
+
+        return _mask_dslv2
+    return None
+
+
 class Wave2CircuitTrainer(Trainer):
     """Custom Trainer that routes waveform/spec inputs into VACTT5."""
+
+    def __init__(self, *args, grammar_masker=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.grammar_masker = grammar_masker
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
         outputs = model(
@@ -71,8 +473,23 @@ class Wave2CircuitTrainer(Trainer):
             filter_type=inputs["filter_type"],
             fc_hz=inputs["fc_hz"],
             labels=inputs["labels"],
+            value_targets=inputs.get("value_targets"),
         )
-        loss = outputs.loss
+        if self.grammar_masker is None:
+            loss = outputs.loss
+        else:
+            logits = outputs.logits
+            labels = inputs["labels"]
+            masked_logits = self.grammar_masker(logits, labels)
+            token_loss = F.cross_entropy(
+                masked_logits.view(-1, masked_logits.size(-1)),
+                labels.view(-1),
+                ignore_index=-100,
+            )
+            value_loss = getattr(outputs, "value_loss", None)
+            if value_loss is not None:
+                token_loss = token_loss + float(getattr(model, "value_loss_weight", 1.0)) * value_loss
+            loss = token_loss
         return (loss, outputs) if return_outputs else loss
 
 
@@ -103,13 +520,32 @@ def parse_args() -> argparse.Namespace:
         default=0.3,
         help="When --use-wave mix, probability of picking real waveform (rest ideal).",
     )
-    p.add_argument("--repr", choices=["vact", "sfci"], default="vact", help="Which token sequence to train on.")
+    p.add_argument("--repr", choices=["vact", "vactdsl", "dslv2", "sfci", "action"], default="vact", help="Which token sequence to train on.")
+    p.add_argument("--grammar-mask", action="store_true", help="Apply FSM grammar mask during training (train/infer aligned).")
     p.add_argument("--wave-norm", action="store_true", help="Per-channel standardize waveforms for stability.")
     p.add_argument("--num-workers", type=int, default=4, help="Dataloader workers.")
     p.add_argument("--seed", type=int, default=42, help="Random seed.")
     p.add_argument("--fp16", action="store_true", help="Use fp16 training if CUDA is available.")
     p.add_argument("--bf16", action="store_true", help="Use bf16 training if supported.")
+    p.add_argument("--value-loss-weight", type=float, default=1.0, help="Weight for continuous value loss.")
     return p.parse_args()
+
+
+def build_value_token_info(tokenizer) -> tuple[list[int], dict[int, int]]:
+    """
+    Returns (value_token_ids, slot_type_token_to_idx).
+    slot_type_token_to_idx maps typed value tokens (e.g., <VAL_L>) to a small slot_type id.
+    """
+    vocab = tokenizer.get_vocab()
+    val_ids: list[int] = []
+    slot_map: dict[int, int] = {}
+    slot_order = {tok: i for i, tok in enumerate(VALUE_SLOTS)}
+    for tok, tid in vocab.items():
+        if tok.startswith("<VAL_"):
+            val_ids.append(int(tid))
+            if tok in slot_order:
+                slot_map[int(tid)] = int(slot_order[tok])
+    return val_ids, slot_map
 
 
 def main() -> None:
@@ -127,7 +563,7 @@ def main() -> None:
     use_fp16 = bool(args.fp16 and torch.cuda.is_available())
     use_bf16 = bool(args.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported())
 
-    value_map = build_value_map(tokenizer)
+    value_token_ids, slot_type_map = build_value_token_info(tokenizer)
 
     train_ds = FilterDesignDataset(
         str(args.data),
@@ -153,9 +589,11 @@ def main() -> None:
     in_channels = sample_wave.shape[0]
     model = VACTT5(
         t5_name=args.t5_name,
-        value_token_to_value=value_map,
         waveform_in_channels=in_channels,
         vocab_size=len(tokenizer),
+        value_loss_weight=args.value_loss_weight,
+        value_token_ids=value_token_ids,
+        slot_type_token_to_idx=slot_type_map,
     )
     model.t5.config.eos_token_id = tokenizer.eos_token_id
     model.t5.config.pad_token_id = tokenizer.pad_token_id
@@ -203,11 +641,12 @@ def main() -> None:
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         data_collator=collate_fn,
+        grammar_masker=build_train_time_grammar_masker(tokenizer, repr_kind=args.repr) if args.grammar_mask else None,
     )
 
     trainer.train()
     trainer.save_model(str(args.output))
-    # Save minimal HF-style artifacts for eval/debug (avoid saving tied ValueAwareEmbedding weights here).
+    # Save minimal HF-style artifacts for eval/debug.
     model.t5.config.save_pretrained(str(args.output))
     model.t5.generation_config.save_pretrained(str(args.output))
     tokenizer.save_pretrained(str(args.output))

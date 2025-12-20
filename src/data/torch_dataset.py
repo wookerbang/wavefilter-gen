@@ -18,7 +18,7 @@ class FilterDesignDataset(Dataset):
         tokenizer,
         use_wave: Literal["ideal", "real", "both", "ideal_s21", "real_s21", "mix"] = "real",
         mix_real_prob: float = 0.3,
-        use_repr: Literal["vact", "sfci"] = "vact",
+        use_repr: Literal["vact", "vactdsl", "sfci", "action"] = "vact",
         normalize_wave: bool = False,
     ):
         self.samples = []
@@ -85,10 +85,23 @@ class FilterDesignDataset(Dataset):
         else:
             wave = torch.stack([ideal_s21, ideal_s11, real_s21, real_s11], dim=0)
 
-        type_id = 0 if s["filter_type"] == "lowpass" else 1
+        ftype = s.get("filter_type", "lowpass")
+        type_map = {"lowpass": 0, "highpass": 1, "bandpass": 2, "bandstop": 3}
+        type_id = type_map.get(ftype, 0)
         scalar = torch.tensor([type_id, s["fc_hz"]], dtype=torch.float32)
 
-        tokens_raw = s.get("vact_tokens") if self.use_repr == "vact" else s.get("sfci_tokens")
+        value_targets = None
+        if self.use_repr == "vact":
+            tokens_raw = s.get("vact_tokens")
+        elif self.use_repr == "vactdsl":
+            tokens_raw = s.get("vactdsl_tokens")
+        elif self.use_repr == "dslv2":
+            tokens_raw = s.get("dslv2_tokens")
+            value_targets = s.get("dslv2_slot_values")
+        elif self.use_repr == "sfci":
+            tokens_raw = s.get("sfci_tokens")
+        else:
+            tokens_raw = s.get("action_tokens")
         tokens_raw = tokens_raw or []
         token_ids = self._tokens_to_ids(tokens_raw)
 
@@ -105,5 +118,9 @@ class FilterDesignDataset(Dataset):
             # keep both keys so collate_fn can pick by repr
             "input_ids": token_ids,
             "vact_tokens": token_ids if self.use_repr == "vact" else None,
+            "vactdsl_tokens": token_ids if self.use_repr == "vactdsl" else None,
+            "dslv2_tokens": token_ids if self.use_repr == "dslv2" else None,
             "sfci_tokens": token_ids if self.use_repr == "sfci" else None,
+            "action_tokens": token_ids if self.use_repr == "action" else None,
+            "value_targets": value_targets,
         }

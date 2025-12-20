@@ -7,8 +7,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-FilterType = Literal["lowpass", "bandpass"]  # 当前主要用 "lowpass"
-PrototypeType = Literal["cheby1"]            # 仅保留 Chebyshev Type I
+FilterType = Literal["lowpass", "bandpass", "highpass", "bandstop"]  # 预留多类型
+PrototypeType = Literal["cheby1", "butter"]  # 支持 Chebyshev I 与 Butterworth
 VariantType = Literal[
     "ideal",               # 原型连续参数缩放得到的理想电路
     "quantized",           # 只做 E12/E24 离散化
@@ -89,6 +89,7 @@ class FilterSample:
     z0: float
     num_L: int
     num_C: int
+    scenario: Optional[str] = None
 
     # 可选信息
     ideal_components: Optional[List[ComponentSpec]] = None
@@ -102,7 +103,11 @@ class FilterSample:
     w_real_S11_db: Any = None
     # 输出
     vact_tokens: Optional[List[str]] = None  # component-centric VACT-Seq tokens
+    vactdsl_tokens: Optional[List[str]] = None  # structured VACT-DSL tokens
+    dslv2_tokens: Optional[List[str]] = None  # structured Macro/Repeat DSL v2 tokens
+    dslv2_slot_values: Optional[List[float]] = None  # numeric slots aligned with dslv2_tokens
     sfci_tokens: Optional[List[str]] = None  # net-centric SFCI tokens
+    action_tokens: Optional[List[str]] = None  # action-oriented construction tokens
     spec_id: Optional[int] = None
     circuit_id: Optional[int] = None
 
@@ -124,7 +129,12 @@ class FilterSample:
             "z0": self.z0,
             "num_L": self.num_L,
             "num_C": self.num_C,
+            "scenario": self.scenario,
             "json_components": self.json_components,
             "vact_tokens": self.vact_tokens or [],
+            "vactdsl_tokens": self.vactdsl_tokens or [],
+            "dslv2_tokens": self.dslv2_tokens or [],
+            "dslv2_slot_values": self.dslv2_slot_values or [],
             "sfci_tokens": self.sfci_tokens or [],
+            "action_tokens": self.action_tokens or [],
         }

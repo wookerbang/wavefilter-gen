@@ -3,31 +3,24 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 import numpy as np
 import torch
 from transformers import AutoTokenizer
 
+# Ensure project root on path
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from src.data.torch_dataset import FilterDesignDataset
-from src.data.vact_codec import vact_tokens_to_components
+from src.data.vact_codec import make_vact_syntax_prefix_allowed_tokens_fn, vact_tokens_to_components
 from src.data import quantization
 from src.models import VACTT5
 from src.data.circuits import components_to_abcd, abcd_to_sparams
 from src.data.spice_runner import simulate_real_waveform
-
-
-def build_value_id_map(tokenizer) -> Dict[int, float]:
-    vocab = tokenizer.get_vocab()
-    mp: Dict[int, float] = {}
-    for tok, tid in vocab.items():
-        if tok.startswith("<VAL_"):
-            label = tok.replace("<VAL_", "").replace(">", "")
-            try:
-                mp[int(tid)] = float(quantization.label_to_value(label))
-            except Exception:
-                continue
-    return mp
 
 
 def build_label_value_map(tokenizer) -> Dict[str, float]:
@@ -45,7 +38,7 @@ def build_label_value_map(tokenizer) -> Dict[str, float]:
 
 def decode_components(token_ids: List[int], tokenizer, label_map: Dict[str, float]):
     tokens = tokenizer.convert_ids_to_tokens(token_ids, skip_special_tokens=True)
-    # Drop leading non-component tokens (e.g., <ORDER_k>, <SEP>) before grouping.
+    # Drop leading non-component tokens (e.g., <ORDER_k>, <SEP>, <CELL>) before grouping.
     while tokens and not (tokens[0].startswith("<L>") or tokens[0].startswith("<C>")):
         tokens.pop(0)
     comps = vact_tokens_to_components(tokens, label_to_value=label_map)
@@ -103,6 +96,7 @@ def main() -> None:
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", type=Path, default=Path("smoke_plot.png"))
     ap.add_argument("--debug", action="store_true", help="Print generated tokens/components for samples.")
+    ap.add_argument("--syntax-mask", action="store_true", help="Apply low-level VACT syntax mask during decoding.")
     ap.add_argument(
         "--dump",
         type=Path,
@@ -121,16 +115,41 @@ def main() -> None:
     in_channels = ds_for_shape[0]["wave"].shape[0]
 
     state_path = args.ckpt / "pytorch_model.bin"
-    value_map = build_value_id_map(tokenizer)
+    def _build_value_token_info(tok):
+        vocab = tok.get_vocab()
+        val_ids = []
+        slot_map = {}
+        slot_order = {t: i for i, t in enumerate(VALUE_SLOTS)}
+        for t, tid in vocab.items():
+            if t.startswith("<VAL_"):
+                val_ids.append(int(tid))
+                if t in slot_order:
+                    slot_map[int(tid)] = int(slot_order[t])
+        return val_ids, slot_map
+
+    value_token_ids, slot_type_map = _build_value_token_info(tokenizer)
+
     model = VACTT5(
         t5_name=args.t5_name,
-        value_token_to_value=value_map,
         waveform_in_channels=in_channels,
         vocab_size=len(tokenizer),
+        value_token_ids=value_token_ids,
+        slot_type_token_to_idx=slot_type_map,
     )
     if state_path.exists():
         state = torch.load(state_path, map_location="cpu")
-        missing, unexpected = model.load_state_dict(state, strict=False)
+        # Be forgiving to config drift (e.g., type_vocab_size changes).
+        model_state = model.state_dict()
+        filtered = {}
+        skipped = []
+        for k, v in state.items():
+            if k in model_state and tuple(model_state[k].shape) == tuple(v.shape):
+                filtered[k] = v
+            else:
+                skipped.append(k)
+        missing, unexpected = model.load_state_dict(filtered, strict=False)
+        if skipped:
+            print(f"[warn] skipped {len(skipped)} mismatched keys (e.g., config drift): {skipped[:6]}")
         if missing or unexpected:
             print(f"Loaded with missing keys ({len(missing)}): {missing}")
             print(f"Loaded with unexpected keys ({len(unexpected)}): {unexpected}")
@@ -144,6 +163,7 @@ def main() -> None:
 
     val_ds = ds_for_shape
     label_map = build_label_value_map(tokenizer)
+    prefix_allowed = make_vact_syntax_prefix_allowed_tokens_fn(tokenizer) if args.syntax_mask else None
 
     idxs = random.sample(range(len(val_ds)), min(args.num, len(val_ds)))
     parse_ok = sim_ok = 0
@@ -172,6 +192,7 @@ def main() -> None:
                 min_new_tokens=args.min_new,
                 eos_token_id=tokenizer.eos_token_id,
                 pad_token_id=tokenizer.pad_token_id,
+                prefix_allowed_tokens_fn=prefix_allowed,
             )[0].cpu().tolist()
 
         try:

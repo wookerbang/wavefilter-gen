@@ -21,6 +21,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--split", type=str, default="train", help="Split name, used in <split>.jsonl.")
     p.add_argument("--use-ngspice", action="store_true", help="Use ngspice for real-wave simulation.")
     p.add_argument("--seed", type=int, default=42, help="Random seed for spec sampling.")
+    p.add_argument("--vact-cell", dest="vact_cell", action="store_true", help="Insert <CELL> markers in VACT.")
+    p.add_argument("--no-vact-cell", dest="vact_cell", action="store_false", help="Disable <CELL> markers in VACT.")
+    p.set_defaults(vact_cell=True)
+    p.add_argument("--vactdsl", dest="vactdsl", action="store_true", help="Emit VACT-DSL tokens (default: on).")
+    p.add_argument("--no-vactdsl", dest="vactdsl", action="store_false", help="Disable VACT-DSL token emission.")
+    p.set_defaults(vactdsl=True)
+    p.add_argument("--actions", dest="actions", action="store_true", help="Emit action-construction tokens (default: on).")
+    p.add_argument("--no-actions", dest="actions", action="store_false", help="Disable action-construction tokens.")
+    p.set_defaults(actions=True)
+    p.add_argument("--dslv2", dest="dslv2", action="store_true", help="Emit VACT-DSL v2 tokens (macro/repeat).")
+    p.add_argument("--no-dslv2", dest="dslv2", action="store_false", help="Disable VACT-DSL v2 tokens.")
+    p.set_defaults(dslv2=True)
+    p.add_argument("--max-nodes", type=int, default=32, help="Max internal nodes after canonicalization (n1..nK).")
     return p.parse_args()
 
 
@@ -32,6 +45,11 @@ def main() -> None:
         split=args.split,
         use_ngspice=bool(args.use_ngspice),
         seed=args.seed,
+        emit_vact_cells=bool(args.vact_cell),
+        emit_vactdsl=bool(args.vactdsl),
+        emit_actions=bool(args.actions),
+        emit_dslv2=bool(args.dslv2),
+        max_nodes=int(args.max_nodes),
     )
     print(f"Dataset written to {path}")
 

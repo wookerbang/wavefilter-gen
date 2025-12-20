@@ -18,7 +18,10 @@ if str(ROOT) not in sys.path:
 
 from src.data.quantization import generate_value_labels  # noqa: E402
 from src.data.vact_codec import build_vact_vocab  # noqa: E402
+from src.data.dsl_codec import build_vactdsl_vocab  # noqa: E402
 from src.data.sfci_net_codec import build_sfci_net_vocab  # noqa: E402
+from src.data.action_codec import build_action_vocab  # noqa: E402
+from src.data.dsl_v2 import build_dslv2_vocab  # noqa: E402
 
 
 SPECIAL_TOKENS = ["<pad>", "</s>", "<unk>"]
@@ -47,8 +50,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--exp-min", type=int, default=-12, help="Minimum exponent for value labels.")
     p.add_argument("--exp-max", type=int, default=3, help="Maximum exponent for value labels.")
     p.add_argument("--order-min", type=int, default=2, help="Minimum filter order for <ORDER_k> tokens.")
-    p.add_argument("--order-max", type=int, default=7, help="Maximum filter order for <ORDER_k> tokens.")
-    p.add_argument("--max-nodes", type=int, default=16, help="Number of intermediate nodes to include (n0..n{max}).")
+    p.add_argument("--order-max", type=int, default=9, help="Maximum filter order for <ORDER_k> tokens.")
+    p.add_argument("--max-nodes", type=int, default=32, help="Number of intermediate nodes to include (n0..n{max}).")
     return p.parse_args()
 
 
@@ -71,6 +74,18 @@ def main() -> None:
     )
     build_wordlevel_tokenizer(vact_vocab, out_dir / "vact_tokenizer")
 
+    # VACT-DSL vocab (superset)
+    vactdsl_vocab = SPECIAL_TOKENS + build_vactdsl_vocab(
+        value_labels=val_labels,
+        node_names=node_names,
+        order_range=order_range,
+    )
+    build_wordlevel_tokenizer(vactdsl_vocab, out_dir / "vactdsl_tokenizer")
+
+    # VACT-DSL v2 vocab (macro/repeat/slots)
+    dslv2_vocab = SPECIAL_TOKENS + build_dslv2_vocab()
+    build_wordlevel_tokenizer(dslv2_vocab, out_dir / "dslv2_tokenizer")
+
     # SFCI net-centric vocab
     sfci_vocab = SPECIAL_TOKENS + build_sfci_net_vocab(
         value_labels=val_labels,
@@ -79,8 +94,15 @@ def main() -> None:
     )
     build_wordlevel_tokenizer(sfci_vocab, out_dir / "sfci_tokenizer")
 
+    # Action vocab
+    action_vocab = SPECIAL_TOKENS + build_action_vocab(value_labels=val_labels, node_names=node_names)
+    build_wordlevel_tokenizer(action_vocab, out_dir / "action_tokenizer")
+
     print(f"Saved VACT tokenizer to {out_dir / 'vact_tokenizer'}")
+    print(f"Saved VACT-DSL tokenizer to {out_dir / 'vactdsl_tokenizer'}")
+    print(f"Saved DSLv2 tokenizer to {out_dir / 'dslv2_tokenizer'}")
     print(f"Saved SFCI tokenizer to {out_dir / 'sfci_tokenizer'}")
+    print(f"Saved Action tokenizer to {out_dir / 'action_tokenizer'}")
 
 
 if __name__ == "__main__":

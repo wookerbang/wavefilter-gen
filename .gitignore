@@ -21,9 +21,9 @@ dist/
 build/
 
 # Large data, models and artifacts (skip upload)
-checkpoints/
-data/
-artifacts/
+/checkpoints/
+/data/
+/artifacts/
 
 # Model weights and checkpoints
 *.pt

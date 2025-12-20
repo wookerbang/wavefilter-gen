@@ -12,7 +12,7 @@ class SpecEncoder(nn.Module):
     def __init__(
         self,
         d_model: int = 512,
-        type_vocab_size: int = 2,
+        type_vocab_size: int = 4,
         hidden_dim: int = 128,
         use_learnable_token: bool = True,
     ):
