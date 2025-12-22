@@ -5,7 +5,7 @@ import json
 import random
 import sys
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import List
 
 import numpy as np
 import torch
@@ -16,17 +16,16 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src.data.circuits import Circuit
 from src.data.torch_dataset import FilterDesignDataset
+from src.data.token_decode import build_label_value_map, decode_components_from_token_ids
 from src.data.vact_codec import make_vact_syntax_prefix_allowed_tokens_fn
 from src.data.dsl_codec import make_vactdsl_prefix_allowed_tokens_fn
 from src.data.dsl_v2 import VALUE_SLOTS, make_dslv2_prefix_allowed_tokens_fn
-from src.eval.simulate_and_score import (
-    build_label_value_map,
-    decode_components_from_token_ids,
-    refine_component_values_to_match_s21,
-    simulate_s21,
-)
+from src.data.spice_runner import run_ac_analysis_with_ngspice
+from src.eval.metrics import waveform_error
 from src.models import VACTT5
+from src.physics import FastTrackEngine
 
 
 def _parse_csv_floats(s: str) -> List[float]:
@@ -35,6 +34,53 @@ def _parse_csv_floats(s: str) -> List[float]:
 
 def _parse_csv_ints(s: str) -> List[int]:
     return [int(x) for x in s.split(",") if x.strip()]
+
+
+def _ref_freq_hz(freq_hz: np.ndarray, fc_hz: float | None) -> float:
+    if fc_hz is not None and np.isfinite(fc_hz):
+        return float(fc_hz)
+    f_min = float(np.min(freq_hz))
+    f_max = float(np.max(freq_hz))
+    return float(np.sqrt(f_min * f_max))
+
+
+def _simulate_s21_db(
+    *,
+    components,
+    freq_hz: np.ndarray,
+    z0: float,
+    fc_hz: float | None,
+    use_ngspice: bool,
+    q_L: float | None,
+    q_C: float | None,
+    q_model: str,
+    fast_engine: FastTrackEngine,
+) -> np.ndarray:
+    use_spice = bool(use_ngspice) and ((q_L is None and q_C is None) or str(q_model) == "fixed_ref")
+    if use_spice:
+        ref_freq_hz = _ref_freq_hz(freq_hz, fc_hz)
+        circuit = Circuit(components, z0=z0, in_port=("in", "gnd"), out_port=("out", "gnd"))
+        try:
+            s21_db, _ = run_ac_analysis_with_ngspice(
+                circuit,
+                freq_hz,
+                z0,
+                q_L=q_L,
+                q_C=q_C,
+                ref_freq_hz=ref_freq_hz,
+            )
+            return s21_db
+        except RuntimeError:
+            pass
+    ref_freq_hz = _ref_freq_hz(freq_hz, fc_hz) if str(q_model) == "fixed_ref" and (q_L is not None or q_C is not None) else None
+    return fast_engine.simulate_s21_db(
+        components,
+        freq_hz,
+        q_L=q_L,
+        q_C=q_C,
+        q_model=str(q_model),
+        ref_freq_hz=ref_freq_hz,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,7 +108,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--value-mode", choices=["standard", "precision"], default="precision", help="Numeric inference mode for DSL v2 slots.")
 
     # simulation + metric
-    p.add_argument("--sim", choices=["nodal", "abcd"], default="nodal", help="Simulator backend.")
+    p.add_argument("--use-ngspice", dest="use_ngspice", action="store_true", help="Use ngspice for evaluation (fallback to Fast Track).")
+    p.add_argument("--no-ngspice", dest="use_ngspice", action="store_false", help="Disable ngspice; use Fast Track only.")
+    p.set_defaults(use_ngspice=True)
+    p.add_argument("--q", type=float, default=50.0, help="Finite-Q loss model (applied to both L and C unless overridden).")
+    p.add_argument("--q-l", type=float, default=None, help="Override Q for inductors (None -> use --q).")
+    p.add_argument("--q-c", type=float, default=None, help="Override Q for capacitors (None -> use --q).")
+    p.add_argument(
+        "--q-model",
+        type=str,
+        default="freq_dependent",
+        choices=["freq_dependent", "fixed_ref"],
+        help="Q modeling for eval: freq_dependent (high fidelity) or fixed_ref (SPICE-style).",
+    )
     p.add_argument("--error", choices=["mae_lin", "rmse_lin", "mae_db", "rmse_db", "maxe_lin", "maxe_db"], default="mae_lin")
     p.add_argument("--taus", type=str, default="0.01,0.02,0.05", help="Comma-separated τ thresholds for success@τ.")
 
@@ -144,6 +202,10 @@ def main() -> None:
     if kmax < max(k_eval):
         raise ValueError(f"--kmax ({kmax}) must be >= max(--k-eval) ({max(k_eval)})")
 
+    q_l = args.q if args.q_l is None else args.q_l
+    q_c = args.q if args.q_c is None else args.q_c
+    fast_engine: FastTrackEngine | None = None
+
     prefix_allowed = None
     if args.syntax_mask:
         if args.repr == "vact":
@@ -157,7 +219,6 @@ def main() -> None:
     total = 0
     valid_any = 0  # at least one candidate decoded
     sim_any = 0  # at least one candidate simulated
-    passive_ok_any = 0  # at least one simulated candidate is passive (within tol)
     success_counts = {(k, tau): 0 for k in k_eval for tau in taus}
 
     dump_rows = []
@@ -170,16 +231,20 @@ def main() -> None:
         target_s21 = np.asarray(raw.get("real_s21_db") or raw.get("ideal_s21_db") or [], dtype=float)
         if freq.size == 0 or target_s21.size == 0:
             continue
+        z0 = float(raw.get("z0", 50.0))
+        fc_hz_raw = raw.get("fc_hz")
+        if fast_engine is None or float(fast_engine.z0) != z0:
+            fast_engine = FastTrackEngine(z0=z0, device=args.device, dtype=torch.float64)
 
         wave = sample["wave"].unsqueeze(0).to(args.device)
         scalars = sample["scalar"]
         filter_type = scalars[0:1].long().to(args.device)
-        fc_hz = scalars[1:2].to(args.device)
+        fc_hz_tensor = scalars[1:2].to(args.device)
 
         gen_kwargs = dict(
             wave=wave,
             filter_type=filter_type,
-            fc_hz=fc_hz,
+            fc_hz=fc_hz_tensor,
             max_new_tokens=int(args.max_new),
             eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
@@ -214,18 +279,17 @@ def main() -> None:
                     seq_tensor[i, : len(s)] = torch.tensor(s, dtype=torch.long, device=args.device)
                 wave_rep = wave.repeat(len(seqs), 1, 1)
                 filter_rep = filter_type.repeat(len(seqs))
-                fc_rep = fc_hz.repeat(len(seqs))
+                fc_rep = fc_hz_tensor.repeat(len(seqs))
                 with torch.no_grad():
                     pred_vals = model.predict_values(wave_rep, filter_rep, fc_rep, seq_tensor, mode=args.value_mode)
                 pred_vals = pred_vals.detach().cpu().tolist()
                 slot_values_seqs = [pred_vals[i][: seq_lens[i]] for i in range(len(seqs))]
 
         # Candidate list aligned with generation order (length == kmax).
-        # Each entry: (err_value, WaveformError|None, comps|None, tokens|None, passivity_violation_max|None)
+        # Each entry: (err_value, WaveformError|None, comps|None, tokens|None)
         cand_records = []
         any_decoded = False
         any_simulated = False
-        any_passive = False
         for i_seq, seq in enumerate(seqs):
             try:
                 slot_values = slot_values_seqs[i_seq] if slot_values_seqs is not None else None
@@ -237,59 +301,76 @@ def main() -> None:
                     slot_values=slot_values,
                 )
                 if not comps:
-                    cand_records.append((float("inf"), None, None, None, None))
+                    cand_records.append((float("inf"), None, None, None))
                     continue
                 any_decoded = True
-                sim0 = simulate_s21(comps, freq, z0=float(raw.get("z0", 50.0)), sim_kind=args.sim)
+                s21_db = _simulate_s21_db(
+                    components=comps,
+                    freq_hz=freq,
+                    z0=z0,
+                    fc_hz=fc_hz_raw,
+                    use_ngspice=bool(args.use_ngspice),
+                    q_L=q_l,
+                    q_C=q_c,
+                    q_model=str(args.q_model),
+                    fast_engine=fast_engine,
+                )
                 any_simulated = True
-                from src.eval.metrics import waveform_error
-
-                e0 = waveform_error(sim0.s21_db, target_s21, kind=args.error)
-                vpass = sim0.passivity.violation_max if sim0.passivity is not None else None
-                if vpass is not None and vpass <= 1e-6:
-                    any_passive = True
-                cand_records.append((float(e0.value), e0, comps, toks, vpass))
+                e0 = waveform_error(s21_db, target_s21, kind=args.error)
+                cand_records.append((float(e0.value), e0, comps, toks))
             except Exception:
-                cand_records.append((float("inf"), None, None, None, None))
+                cand_records.append((float("inf"), None, None, None))
 
         if any_decoded:
             valid_any += 1
         if any_simulated:
             sim_any += 1
-        if any_passive:
-            passive_ok_any += 1
 
         # refine top-N candidates, then re-rank by refined error.
         if args.refine_steps and int(args.refine_steps) > 0:
             refined_records = list(cand_records)
             # pick top-N by current verifier error (excluding inf failures)
             top_n = max(0, int(args.refine_top))
-            scored = [(score0, j) for j, (score0, err_obj, comps0, toks0, vpass0) in enumerate(refined_records) if np.isfinite(score0) and comps0]
+            scored = [(score0, j) for j, (score0, err_obj, comps0, toks0) in enumerate(refined_records) if np.isfinite(score0) and comps0]
             scored.sort(key=lambda x: float(x[0]))
             refine_idxs = [j for _, j in scored[:top_n]]
+            loss_kind = "mae_db" if args.error == "mae_db" else "mse_db"
             for j in refine_idxs:
-                score0, err_obj, comps0, toks0, vpass0 = refined_records[j]
+                score0, err_obj, comps0, toks0 = refined_records[j]
                 if comps0 is None:
                     continue
-                    try:
-                        comps_r = refine_component_values_to_match_s21(
-                            comps0,
-                            freq_hz=freq,
-                            target_s21_db=target_s21,
-                            z0=float(raw.get("z0", 50.0)),
-                            steps=int(args.refine_steps),
-                            lr=float(args.refine_lr),
-                            max_ratio=float(args.refine_max_ratio),
-                            device=args.device,
-                        )
-                        sim_r = simulate_s21(comps_r, freq, z0=float(raw.get("z0", 50.0)), sim_kind=args.sim)
-                        from src.eval.metrics import waveform_error
-
-                        err_r = waveform_error(sim_r.s21_db, target_s21, kind=args.error)
-                        vpass_r = sim_r.passivity.violation_max if sim_r.passivity is not None else None
-                        refined_records[j] = (float(err_r.value), err_r, comps_r, toks0, vpass_r)
-                    except Exception:
-                        pass
+                try:
+                    res = fast_engine.refine(
+                        comps0,
+                        freq_hz=freq,
+                        target_s21_db=target_s21,
+                        steps=int(args.refine_steps),
+                        lr=float(args.refine_lr),
+                        optimizer="adam",
+                        q_L=q_l,
+                        q_C=q_c,
+                        q_model=str(args.q_model),
+                        ref_freq_hz=_ref_freq_hz(freq, fc_hz_raw) if str(args.q_model) == "fixed_ref" and (q_l is not None or q_c is not None) else None,
+                        max_ratio=float(args.refine_max_ratio),
+                        loss_kind=loss_kind,
+                        snap_series=None,
+                    )
+                    comps_r = res.refined_components
+                    s21_db_r = _simulate_s21_db(
+                        components=comps_r,
+                        freq_hz=freq,
+                        z0=z0,
+                        fc_hz=fc_hz_raw,
+                        use_ngspice=bool(args.use_ngspice),
+                        q_L=q_l,
+                        q_C=q_c,
+                        q_model=str(args.q_model),
+                        fast_engine=fast_engine,
+                    )
+                    err_r = waveform_error(s21_db_r, target_s21, kind=args.error)
+                    refined_records[j] = (float(err_r.value), err_r, comps_r, toks0)
+                except Exception:
+                    pass
             cand_records = refined_records
 
         # compute best-of-K success in *generation order*
@@ -317,7 +398,6 @@ def main() -> None:
                     "error_kind": best[1].kind if best[1] is not None else args.error,
                     "best_error": float(best[0]),
                     "num_components": len(best[2] or []),
-                    "passivity_violation_max": best[4],
                     "gen_tokens": (best[3] or [])[:200],
                 }
             )
@@ -325,7 +405,6 @@ def main() -> None:
     print(f"Samples evaluated: {total}")
     print(f"Validity@Kmax:    {valid_any}/{total}")
     print(f"Simulated@Kmax:   {sim_any}/{total}")
-    print(f"Passive@Kmax:     {passive_ok_any}/{total} (σ_max(S)<=1)")
     for k in k_eval:
         for tau in taus:
             num = success_counts[(k, tau)]

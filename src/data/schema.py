@@ -101,6 +101,10 @@ class FilterSample:
     w_real_S21_db: Any = None
     w_ideal_S11_db: Any = None
     w_real_S11_db: Any = None
+    passband_min_db: Optional[float] = None
+    stopband_max_db: Optional[float] = None
+    mask_min_db: Any = None
+    mask_max_db: Any = None
     # 输出
     vact_tokens: Optional[List[str]] = None  # component-centric VACT-Seq tokens
     vactdsl_tokens: Optional[List[str]] = None  # structured VACT-DSL tokens
@@ -130,6 +134,8 @@ class FilterSample:
             "num_L": self.num_L,
             "num_C": self.num_C,
             "scenario": self.scenario,
+            "passband_min_db": self.passband_min_db,
+            "stopband_max_db": self.stopband_max_db,
             "json_components": self.json_components,
             "vact_tokens": self.vact_tokens or [],
             "vactdsl_tokens": self.vactdsl_tokens or [],

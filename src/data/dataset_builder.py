@@ -9,9 +9,9 @@ import os
 from typing import List
 
 import numpy as np
+import torch
 
 from .gen_prototype import (
-    compute_ideal_waveform,
     sample_filter_spec,
     synthesize_filter,
 )
@@ -24,6 +24,7 @@ from .dsl_codec import components_to_vactdsl_tokens
 from .node_canonicalizer import canonicalize_nodes
 from .action_codec import components_to_action_tokens
 from .dsl_v2 import components_to_dslv2_tokens
+from src.physics import FastTrackEngine
 
 
 def _serialize_components(comps: List[ComponentSpec]) -> List[dict]:
@@ -39,6 +40,8 @@ def _serialize_sample(sample: FilterSample) -> dict:
             "ideal_s11_db": np.asarray(sample.w_ideal_S11_db, dtype=float).tolist() if sample.w_ideal_S11_db is not None else None,
             "real_s21_db": np.asarray(sample.w_real_S21_db, dtype=float).tolist() if sample.w_real_S21_db is not None else None,
             "real_s11_db": np.asarray(sample.w_real_S11_db, dtype=float).tolist() if sample.w_real_S11_db is not None else None,
+            "mask_min_db": np.asarray(sample.mask_min_db, dtype=float).tolist() if sample.mask_min_db is not None else None,
+            "mask_max_db": np.asarray(sample.mask_max_db, dtype=float).tolist() if sample.mask_max_db is not None else None,
             "ideal_components": _serialize_components(sample.ideal_components or []),
             "discrete_components": _serialize_components(sample.discrete_components or []),
             "vact_tokens": sample.vact_tokens or [],
@@ -66,6 +69,7 @@ def build_dataset(
     q_L: float | None = 50.0,
     q_C: float | None = 50.0,
     tol_frac: float = 0.05,
+    q_model: str = "freq_dependent",
 ) -> str:
     """
     串起采样 → 原型 → 离散化 → 仿真 → 序列化。
@@ -76,6 +80,7 @@ def build_dataset(
     jsonl_path = os.path.join(output_dir, f"{split}.jsonl")
 
     rng = np.random.default_rng(seed)
+    fast_engine: FastTrackEngine | None = None
 
     def _apply_tolerance(comps: List[ComponentSpec]) -> List[ComponentSpec]:
         t = float(tol_frac or 0.0)
@@ -96,10 +101,50 @@ def build_dataset(
             )
         return out
 
+    def _build_spec_masks(spec: dict, freq_hz: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float]:
+        f = np.asarray(freq_hz, dtype=float)
+        mask_min = np.full_like(f, np.nan, dtype=float)
+        mask_max = np.full_like(f, np.nan, dtype=float)
+        fc = float(spec.get("fc_hz", 0.0))
+        ripple_db = float(spec.get("ripple_db", 0.5))
+        passband_min_db = -abs(ripple_db)
+        stopband_max_db = float(spec.get("stopband_max_db", -40.0))
+        ftype = spec.get("filter_type", "lowpass")
+        if ftype == "lowpass":
+            pass_mask = f <= fc
+            stop_mask = f >= 2.0 * fc
+        elif ftype == "highpass":
+            pass_mask = f >= fc
+            stop_mask = f <= 0.5 * fc
+        elif ftype == "bandpass":
+            bw = float(spec.get("bw_frac") or 0.2)
+            pass_lo = fc * (1.0 - 0.5 * bw)
+            pass_hi = fc * (1.0 + 0.5 * bw)
+            stop_lo = fc * (1.0 - 1.5 * bw)
+            stop_hi = fc * (1.0 + 1.5 * bw)
+            pass_mask = (f >= pass_lo) & (f <= pass_hi)
+            stop_mask = (f <= stop_lo) | (f >= stop_hi)
+        elif ftype == "bandstop":
+            bw = float(spec.get("bw_frac") or 0.2)
+            stop_lo = fc * (1.0 - 0.5 * bw)
+            stop_hi = fc * (1.0 + 0.5 * bw)
+            pass_lo = fc * (1.0 - 1.5 * bw)
+            pass_hi = fc * (1.0 + 1.5 * bw)
+            pass_mask = (f <= pass_lo) | (f >= pass_hi)
+            stop_mask = (f >= stop_lo) & (f <= stop_hi)
+        else:
+            pass_mask = f <= fc
+            stop_mask = f >= 2.0 * fc
+        mask_min[pass_mask] = passband_min_db
+        mask_max[stop_mask] = stopband_max_db
+        return mask_min, mask_max, passband_min_db, stopband_max_db
+
     with open(jsonl_path, "w") as f:
         for i in range(num_samples):
             spec = sample_filter_spec(rng=rng)
             z0 = spec["z0"]
+            if fast_engine is None or float(z0) != float(fast_engine.z0):
+                fast_engine = FastTrackEngine(z0=float(z0), device="cpu", dtype=torch.float64)
             base_components = synthesize_filter(spec)
 
             # 频率轴：依据 filter_type 选取覆盖区间
@@ -111,6 +156,7 @@ def build_dataset(
                 f_min = fc * (1 - fbw) * 0.8
                 f_max = fc * (1 + fbw) * 1.2
             freq_hz = np.logspace(np.log10(f_min), np.log10(f_max), 256)
+            mask_min_db, mask_max_db, passband_min_db, stopband_max_db = _build_spec_masks(spec, freq_hz)
 
             # dual-band：并联第二个 bandpass 子滤波器
             if spec.get("scenario") == "dualband" and spec.get("fc2_hz"):
@@ -161,6 +207,7 @@ def build_dataset(
 
             # Output label: nominal standard parts (no tolerance, no loss).
             discrete_components = quantize_components(base_components, series="E24")
+            ref_freq_hz = float(spec.get("fc_hz") or np.sqrt(float(np.min(freq_hz)) * float(np.max(freq_hz))))
             if need_sim_for_ideal and use_ngspice:
                 ideal_s21_db, ideal_s11_db = simulate_real_waveform(
                     discrete_components,
@@ -169,22 +216,41 @@ def build_dataset(
                     use_ngspice=True,
                     q_L=None,
                     q_C=None,
-                    ref_freq_hz=float(spec.get("fc_hz") or np.sqrt(float(np.min(freq_hz)) * float(np.max(freq_hz)))),
+                    ref_freq_hz=ref_freq_hz,
+                    q_model=q_model,
                 )
             else:
-                ideal_s21_db, ideal_s11_db = compute_ideal_waveform(discrete_components, spec, freq_hz)
+                ideal_s21_db, ideal_s11_db = fast_engine.simulate_sparams_db(
+                    discrete_components,
+                    freq_hz,
+                    q_L=None,
+                    q_C=None,
+                    q_model="freq_dependent",
+                )
 
             # Input waveform: tolerance-perturbed + finite-Q loss model.
             real_components = _apply_tolerance(discrete_components)
-            real_s21_db, real_s11_db = simulate_real_waveform(
-                real_components,
-                spec,
-                freq_hz,
-                use_ngspice=use_ngspice,
-                q_L=q_L,
-                q_C=q_C,
-                ref_freq_hz=float(spec.get("fc_hz") or np.sqrt(float(np.min(freq_hz)) * float(np.max(freq_hz)))),
-            )
+            use_spice_real = bool(use_ngspice) and ((q_L is None and q_C is None) or str(q_model) == "fixed_ref")
+            if use_spice_real:
+                real_s21_db, real_s11_db = simulate_real_waveform(
+                    real_components,
+                    spec,
+                    freq_hz,
+                    use_ngspice=True,
+                    q_L=q_L,
+                    q_C=q_C,
+                    ref_freq_hz=ref_freq_hz,
+                    q_model=q_model,
+                )
+            else:
+                real_s21_db, real_s11_db = fast_engine.simulate_sparams_db(
+                    real_components,
+                    freq_hz,
+                    q_L=q_L,
+                    q_C=q_C,
+                    q_model=str(q_model),
+                    ref_freq_hz=ref_freq_hz if str(q_model) == "fixed_ref" else None,
+                )
 
             # --- Sanity checks ---
             if real_s21_db is None or np.any(np.isnan(real_s21_db)):
@@ -245,6 +311,10 @@ def build_dataset(
                 w_real_S21_db=real_s21_db,
                 w_ideal_S11_db=ideal_s11_db,
                 w_real_S11_db=real_s11_db,
+                passband_min_db=passband_min_db,
+                stopband_max_db=stopband_max_db,
+                mask_min_db=mask_min_db,
+                mask_max_db=mask_max_db,
                 vact_tokens=vact_tokens,
                 vactdsl_tokens=vactdsl_tokens,
                 dslv2_tokens=dslv2_tokens,

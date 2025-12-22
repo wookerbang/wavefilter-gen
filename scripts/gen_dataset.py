@@ -19,12 +19,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-samples", type=int, default=10, help="Number of samples to generate.")
     p.add_argument("--output-dir", type=Path, default=Path("data/processed/demo"), help="Directory to write jsonl.")
     p.add_argument("--split", type=str, default="train", help="Split name, used in <split>.jsonl.")
-    p.add_argument("--use-ngspice", action="store_true", help="Use ngspice for real-wave simulation.")
+    p.add_argument(
+        "--use-ngspice",
+        action="store_true",
+        help="Use ngspice for wave simulation when possible (otherwise fall back to Fast Track).",
+    )
     p.add_argument("--seed", type=int, default=42, help="Random seed for spec sampling.")
     p.add_argument("--q", type=float, default=50.0, help="Finite-Q loss model (applied to both L and C unless overridden).")
     p.add_argument("--q-l", type=float, default=None, help="Override Q for inductors (None -> use --q).")
     p.add_argument("--q-c", type=float, default=None, help="Override Q for capacitors (None -> use --q).")
     p.add_argument("--tol", type=float, default=0.05, help="Component tolerance fraction for input waveforms (e.g. 0.05 = ±5%).")
+    p.add_argument(
+        "--q-model",
+        type=str,
+        default="freq_dependent",
+        choices=["freq_dependent", "fixed_ref"],
+        help="Q modeling for real waveforms: freq_dependent (Fast Track) or fixed_ref (SPICE-style).",
+    )
     p.add_argument("--vact-cell", dest="vact_cell", action="store_true", help="Insert <CELL> markers in VACT.")
     p.add_argument("--no-vact-cell", dest="vact_cell", action="store_false", help="Disable <CELL> markers in VACT.")
     p.set_defaults(vact_cell=True)
@@ -59,6 +70,7 @@ def main() -> None:
         q_L=q_l,
         q_C=q_c,
         tol_frac=float(args.tol),
+        q_model=str(args.q_model),
     )
     print(f"Dataset written to {path}")
 

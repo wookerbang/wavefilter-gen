@@ -7,11 +7,11 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
-from typing import Tuple
+from typing import Literal, Tuple
 
 import numpy as np
 
-from .circuits import Circuit, abcd_to_sparams, components_to_abcd
+from .circuits import Circuit
 from .schema import ComponentSpec
 
 
@@ -130,21 +130,39 @@ def simulate_real_waveform(
     q_L: float | None = None,
     q_C: float | None = None,
     ref_freq_hz: float | None = None,
+    q_model: Literal["freq_dependent", "fixed_ref"] = "freq_dependent",
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     构造 Circuit -> 仿真得到 real S21/S11。
-    ngspice 不可用时，退化为理想 ABCD 计算。
+    ngspice 不可用时，退化为 Fast Track 物理引擎计算。
+    q_model:
+      - "freq_dependent": keep Q constant over band (R/G varies with frequency).
+      - "fixed_ref": use fixed R/G at ref_freq_hz (matches SPICE netlist).
     """
     z0 = float(spec["z0"])
-    circuit = Circuit(components, z0=z0)
+    circuit = Circuit(components, z0=z0, in_port=("in", "gnd"), out_port=("out", "gnd"))
     if use_ngspice:
-        try:
-            if ref_freq_hz is None:
-                ref_freq_hz = float(spec.get("fc_hz") or np.sqrt(float(np.min(freq_hz)) * float(np.max(freq_hz))))
-            return run_ac_analysis_with_ngspice(circuit, freq_hz, z0, q_L=q_L, q_C=q_C, ref_freq_hz=ref_freq_hz)
-        except RuntimeError:
-            pass
+        if (q_L is not None or q_C is not None) and q_model == "freq_dependent":
+            use_ngspice = False
+        else:
+            try:
+                if ref_freq_hz is None:
+                    ref_freq_hz = float(spec.get("fc_hz") or np.sqrt(float(np.min(freq_hz)) * float(np.max(freq_hz))))
+                return run_ac_analysis_with_ngspice(circuit, freq_hz, z0, q_L=q_L, q_C=q_C, ref_freq_hz=ref_freq_hz)
+            except RuntimeError:
+                pass
 
-    # 回退：用理想模型替代
-    A, B, C, D = components_to_abcd(components, freq_hz, z0, q_L=q_L, q_C=q_C)
-    return abcd_to_sparams(A, B, C, D, z0)
+    # 回退：用 Fast Track 引擎替代（支持 notch 与可微 Q 模型）
+    import torch
+
+    from src.physics import FastTrackEngine
+
+    engine = FastTrackEngine(z0=z0, device="cpu", dtype=torch.float64)
+    return engine.simulate_sparams_db(
+        components,
+        freq_hz,
+        q_L=q_L,
+        q_C=q_C,
+        q_model=str(q_model),
+        ref_freq_hz=ref_freq_hz if q_model == "fixed_ref" else None,
+    )

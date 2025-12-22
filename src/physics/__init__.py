@@ -5,12 +5,14 @@ from .differentiable_rf import (
     InferenceTimeOptimizer,
     RefinementResult,
 )
+from .fast_engine import FastTrackEngine, FastTrackSParams
 
 __all__ = [
     "CascadedABCDCircuit",
     "DifferentiablePhysicsKernel",
     "DynamicCircuitAssembler",
+    "FastTrackEngine",
+    "FastTrackSParams",
     "InferenceTimeOptimizer",
     "RefinementResult",
 ]
-

@@ -3,8 +3,9 @@ import unittest
 import numpy as np
 import torch
 
-from src.data.circuits import abcd_to_sparams, components_to_abcd
+from src.data.circuits import abcd_to_sparams, components_to_abcd, components_to_sparams_nodal
 from src.data.schema import ComponentSpec
+from src.physics import FastTrackEngine
 from src.physics.differentiable_rf import DifferentiablePhysicsKernel, DynamicCircuitAssembler, InferenceTimeOptimizer
 
 
@@ -97,6 +98,18 @@ class DifferentiableRFTests(unittest.TestCase):
         self.assertIsNotNone(res.snapped_loss)
         self.assertTrue(np.isfinite(float(res.snapped_loss)))
 
+    def test_fast_track_engine_matches_circuit(self):
+        comps = self._ladder_components()
+        z0 = 50.0
+        freq_hz = np.logspace(6, 9, 128)
+        engine = FastTrackEngine(z0=z0, device="cpu", dtype=torch.float64)
+        s21_db_engine = engine.simulate_s21_db(comps, freq_hz, q_L=None, q_C=None)
+
+        assembler = DynamicCircuitAssembler(z0=z0)
+        circuit, _ = assembler.assemble(comps, trainable=False, q_L=None, q_C=None, eps=1e-18, dtype=torch.float64)
+        s21_db_t = circuit(torch.tensor(freq_hz, dtype=torch.float64), output="s21_db").detach().cpu().numpy()
+        np.testing.assert_allclose(s21_db_engine, s21_db_t, rtol=0, atol=1e-9)
+
     def test_q_model_adds_inductor_series_resistance(self):
         L = torch.tensor([10e-9], dtype=torch.float64).reshape(1, 1)  # (B,N)
         f = torch.tensor([1e9], dtype=torch.float64)
@@ -114,6 +127,21 @@ class DifferentiableRFTests(unittest.TestCase):
         omega = 2.0 * np.pi * float(f.item())
         g_expected = omega * float(Cval.item()) / q
         self.assertAlmostEqual(float(C.real.item()), g_expected, places=12)
+
+    def test_notch_branch_matches_nodal(self):
+        comps = [
+            ComponentSpec("L", "series", 6.8e-9, None, "in", "out"),
+            ComponentSpec("L", "series", 12e-9, None, "in", "x1"),
+            ComponentSpec("C", "series", 1.2e-12, None, "x1", "gnd"),
+        ]
+        freq_hz = np.logspace(7, 9, 96)
+        S = components_to_sparams_nodal(comps, freq_hz, z0=50.0)
+        s21_db_nodal = 20.0 * np.log10(np.abs(S[:, 1, 0]) + 1e-12)
+
+        assembler = DynamicCircuitAssembler(z0=50.0)
+        circuit, _ = assembler.assemble(comps, trainable=False, q_L=None, q_C=None, eps=1e-18, dtype=torch.float64)
+        s21_db_t = circuit(torch.tensor(freq_hz, dtype=torch.float64), output="s21_db").detach().cpu().numpy()
+        np.testing.assert_allclose(s21_db_t, s21_db_nodal, rtol=0, atol=1e-6)
 
 
 if __name__ == "__main__":
