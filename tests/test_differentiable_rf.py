@@ -5,7 +5,7 @@ import torch
 
 from src.data.circuits import abcd_to_sparams, components_to_abcd
 from src.data.schema import ComponentSpec
-from src.physics.differentiable_rf import DynamicCircuitAssembler, InferenceTimeOptimizer
+from src.physics.differentiable_rf import DifferentiablePhysicsKernel, DynamicCircuitAssembler, InferenceTimeOptimizer
 
 
 class DifferentiableRFTests(unittest.TestCase):
@@ -26,7 +26,7 @@ class DifferentiableRFTests(unittest.TestCase):
         s21_db_np, _ = abcd_to_sparams(A, B, C, D, z0)
 
         assembler = DynamicCircuitAssembler(z0=z0)
-        circuit, _ = assembler.assemble(comps, trainable=False, eps=1e-18, dtype=torch.float64)
+        circuit, _ = assembler.assemble(comps, trainable=False, q_L=None, q_C=None, eps=1e-18, dtype=torch.float64)
         s21_db_t = circuit(torch.tensor(freq_hz, dtype=torch.float64), output="s21_db").detach().cpu().numpy()
         np.testing.assert_allclose(s21_db_t, s21_db_np, rtol=0, atol=1e-9)
 
@@ -35,7 +35,7 @@ class DifferentiableRFTests(unittest.TestCase):
         z0 = 50.0
         freq_hz = torch.logspace(6, 9, 64, dtype=torch.float64)
         assembler = DynamicCircuitAssembler(z0=z0)
-        circuit, _ = assembler.assemble(comps, trainable=False, eps=1e-18, dtype=torch.float64)
+        circuit, _ = assembler.assemble(comps, trainable=False, q_L=None, q_C=None, eps=1e-18, dtype=torch.float64)
 
         values = torch.tensor([c.value_si for c in comps], dtype=torch.float64, requires_grad=True)
         pred = circuit(freq_hz, values=values, output="s21_db")
@@ -50,7 +50,7 @@ class DifferentiableRFTests(unittest.TestCase):
         z0 = 50.0
         freq_hz = torch.logspace(6, 9, 32, dtype=torch.float64)
         assembler = DynamicCircuitAssembler(z0=z0)
-        circuit, _ = assembler.assemble(comps, trainable=False, eps=1e-18, dtype=torch.float64)
+        circuit, _ = assembler.assemble(comps, trainable=False, q_L=None, q_C=None, eps=1e-18, dtype=torch.float64)
 
         base = torch.tensor([c.value_si for c in comps], dtype=torch.float64)
         values = torch.stack([base, base * 1.1], dim=0)
@@ -63,7 +63,7 @@ class DifferentiableRFTests(unittest.TestCase):
         true_comps = self._ladder_components()
 
         assembler = DynamicCircuitAssembler(z0=z0)
-        true_circuit, _ = assembler.assemble(true_comps, trainable=False, eps=1e-18, dtype=torch.float64)
+        true_circuit, _ = assembler.assemble(true_comps, trainable=False, q_L=None, q_C=None, eps=1e-18, dtype=torch.float64)
         target = true_circuit(torch.tensor(freq_hz, dtype=torch.float64), output="s21_db").detach()
 
         init_comps = [
@@ -87,13 +87,34 @@ class DifferentiableRFTests(unittest.TestCase):
             lr=1e-1,
             max_ratio=3.0,
             optimizer="adam",
+            q_L=50.0,
+            q_C=50.0,
         )
 
         self.assertEqual(len(res.loss_history), 60)
         self.assertLess(res.final_loss, res.initial_loss)
         self.assertTrue(all(c.value_si > 0 for c in res.refined_components))
+        self.assertIsNotNone(res.snapped_loss)
+        self.assertTrue(np.isfinite(float(res.snapped_loss)))
+
+    def test_q_model_adds_inductor_series_resistance(self):
+        L = torch.tensor([10e-9], dtype=torch.float64).reshape(1, 1)  # (B,N)
+        f = torch.tensor([1e9], dtype=torch.float64)
+        q = 50.0
+        A, B, C, D = DifferentiablePhysicsKernel.cascade_abcd([DifferentiablePhysicsKernel.OP_SERIES_L], L, f, q_L=q, q_C=None, eps=1e-30)
+        omega = 2.0 * np.pi * float(f.item())
+        r_expected = omega * float(L.item()) / q
+        self.assertAlmostEqual(float(B.real.item()), r_expected, places=9)
+
+    def test_q_model_adds_capacitor_parallel_conductance(self):
+        Cval = torch.tensor([1e-12], dtype=torch.float64).reshape(1, 1)  # (B,N)
+        f = torch.tensor([2e9], dtype=torch.float64)
+        q = 100.0
+        A, B, C, D = DifferentiablePhysicsKernel.cascade_abcd([DifferentiablePhysicsKernel.OP_SHUNT_C], Cval, f, q_L=None, q_C=q, eps=1e-30)
+        omega = 2.0 * np.pi * float(f.item())
+        g_expected = omega * float(Cval.item()) / q
+        self.assertAlmostEqual(float(C.real.item()), g_expected, places=12)
 
 
 if __name__ == "__main__":
     unittest.main()
-

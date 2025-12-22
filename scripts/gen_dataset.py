@@ -21,6 +21,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--split", type=str, default="train", help="Split name, used in <split>.jsonl.")
     p.add_argument("--use-ngspice", action="store_true", help="Use ngspice for real-wave simulation.")
     p.add_argument("--seed", type=int, default=42, help="Random seed for spec sampling.")
+    p.add_argument("--q", type=float, default=50.0, help="Finite-Q loss model (applied to both L and C unless overridden).")
+    p.add_argument("--q-l", type=float, default=None, help="Override Q for inductors (None -> use --q).")
+    p.add_argument("--q-c", type=float, default=None, help="Override Q for capacitors (None -> use --q).")
+    p.add_argument("--tol", type=float, default=0.05, help="Component tolerance fraction for input waveforms (e.g. 0.05 = ±5%).")
     p.add_argument("--vact-cell", dest="vact_cell", action="store_true", help="Insert <CELL> markers in VACT.")
     p.add_argument("--no-vact-cell", dest="vact_cell", action="store_false", help="Disable <CELL> markers in VACT.")
     p.set_defaults(vact_cell=True)
@@ -39,6 +43,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    q_l = args.q if args.q_l is None else args.q_l
+    q_c = args.q if args.q_c is None else args.q_c
     path = build_dataset(
         num_samples=args.num_samples,
         output_dir=str(args.output_dir),
@@ -50,6 +56,9 @@ def main() -> None:
         emit_actions=bool(args.actions),
         emit_dslv2=bool(args.dslv2),
         max_nodes=int(args.max_nodes),
+        q_L=q_l,
+        q_C=q_c,
+        tol_frac=float(args.tol),
     )
     print(f"Dataset written to {path}")
 

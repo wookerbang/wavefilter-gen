@@ -63,6 +63,9 @@ def build_dataset(
     emit_actions: bool = True,
     emit_dslv2: bool = True,
     max_nodes: int = 32,
+    q_L: float | None = 50.0,
+    q_C: float | None = 50.0,
+    tol_frac: float = 0.05,
 ) -> str:
     """
     串起采样 → 原型 → 离散化 → 仿真 → 序列化。
@@ -73,6 +76,25 @@ def build_dataset(
     jsonl_path = os.path.join(output_dir, f"{split}.jsonl")
 
     rng = np.random.default_rng(seed)
+
+    def _apply_tolerance(comps: List[ComponentSpec]) -> List[ComponentSpec]:
+        t = float(tol_frac or 0.0)
+        if t <= 0:
+            return list(comps)
+        out: List[ComponentSpec] = []
+        for c in comps:
+            scale = float(rng.uniform(1.0 - t, 1.0 + t))
+            out.append(
+                ComponentSpec(
+                    ctype=c.ctype,
+                    role=c.role,
+                    value_si=float(c.value_si) * scale,
+                    std_label=c.std_label,
+                    node1=c.node1,
+                    node2=c.node2,
+                )
+            )
+        return out
 
     with open(jsonl_path, "w") as f:
         for i in range(num_samples):
@@ -133,16 +155,36 @@ def build_dataset(
 
             # 非纯 ladder（notch/dualband/BP）优先用仿真获取 ideal，以避免 ABCD 近似误差
             need_sim_for_ideal = spec.get("scenario") in ("notch", "dualband") or spec.get("filter_type") != "lowpass"
-            if need_sim_for_ideal and use_ngspice:
-                ideal_s21_db, ideal_s11_db = simulate_real_waveform(base_components, spec, freq_hz, use_ngspice=True)
-            else:
-                ideal_s21_db, ideal_s11_db = compute_ideal_waveform(base_components, spec, freq_hz)
 
             # Canonicalize node names so tokenization stays in-vocab.
             base_components = canonicalize_nodes(base_components, max_nodes=max_nodes)
 
+            # Output label: nominal standard parts (no tolerance, no loss).
             discrete_components = quantize_components(base_components, series="E24")
-            real_s21_db, real_s11_db = simulate_real_waveform(discrete_components, spec, freq_hz, use_ngspice=use_ngspice)
+            if need_sim_for_ideal and use_ngspice:
+                ideal_s21_db, ideal_s11_db = simulate_real_waveform(
+                    discrete_components,
+                    spec,
+                    freq_hz,
+                    use_ngspice=True,
+                    q_L=None,
+                    q_C=None,
+                    ref_freq_hz=float(spec.get("fc_hz") or np.sqrt(float(np.min(freq_hz)) * float(np.max(freq_hz)))),
+                )
+            else:
+                ideal_s21_db, ideal_s11_db = compute_ideal_waveform(discrete_components, spec, freq_hz)
+
+            # Input waveform: tolerance-perturbed + finite-Q loss model.
+            real_components = _apply_tolerance(discrete_components)
+            real_s21_db, real_s11_db = simulate_real_waveform(
+                real_components,
+                spec,
+                freq_hz,
+                use_ngspice=use_ngspice,
+                q_L=q_L,
+                q_C=q_C,
+                ref_freq_hz=float(spec.get("fc_hz") or np.sqrt(float(np.min(freq_hz)) * float(np.max(freq_hz)))),
+            )
 
             # --- Sanity checks ---
             if real_s21_db is None or np.any(np.isnan(real_s21_db)):

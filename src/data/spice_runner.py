@@ -19,6 +19,10 @@ def run_ac_analysis_with_ngspice(
     circuit: Circuit,
     freq_hz: np.ndarray,
     z0: float = 50.0,
+    *,
+    q_L: float | None = None,
+    q_C: float | None = None,
+    ref_freq_hz: float | None = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     用 ngspice 进行 AC 分析，返回 S21/S11 in dB。
@@ -32,7 +36,9 @@ def run_ac_analysis_with_ngspice(
         net_path = os.path.join(tmpdir, "circuit.sp")
         log_path = os.path.join(tmpdir, "ngspice.log")
         csv_path = os.path.join(tmpdir, "ac.csv")
-        netlist = circuit.to_spice_netlist()
+        if ref_freq_hz is None:
+            ref_freq_hz = float(np.sqrt(f_start * f_stop))
+        netlist = circuit.to_spice_netlist(q_L=q_L, q_C=q_C, ref_freq_hz=ref_freq_hz)
         lines = [netlist]
         # 使用对数扫描与上游 logspace 频网更匹配
         decades = max(1, np.ceil(np.log10(f_stop / f_start)))
@@ -120,6 +126,10 @@ def simulate_real_waveform(
     spec: dict,
     freq_hz: np.ndarray,
     use_ngspice: bool = True,
+    *,
+    q_L: float | None = None,
+    q_C: float | None = None,
+    ref_freq_hz: float | None = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     构造 Circuit -> 仿真得到 real S21/S11。
@@ -129,10 +139,12 @@ def simulate_real_waveform(
     circuit = Circuit(components, z0=z0)
     if use_ngspice:
         try:
-            return run_ac_analysis_with_ngspice(circuit, freq_hz, z0)
+            if ref_freq_hz is None:
+                ref_freq_hz = float(spec.get("fc_hz") or np.sqrt(float(np.min(freq_hz)) * float(np.max(freq_hz))))
+            return run_ac_analysis_with_ngspice(circuit, freq_hz, z0, q_L=q_L, q_C=q_C, ref_freq_hz=ref_freq_hz)
         except RuntimeError:
             pass
 
     # 回退：用理想模型替代
-    A, B, C, D = components_to_abcd(components, freq_hz, z0)
+    A, B, C, D = components_to_abcd(components, freq_hz, z0, q_L=q_L, q_C=q_C)
     return abcd_to_sparams(A, B, C, D, z0)

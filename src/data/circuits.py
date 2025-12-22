@@ -33,7 +33,14 @@ class Circuit:
         self.in_port = in_port
         self.out_port = out_port or (_infer_output_node(components), "gnd")
 
-    def to_spice_netlist(self, title: str = "LC_FILTER") -> str:
+    def to_spice_netlist(
+        self,
+        title: str = "LC_FILTER",
+        *,
+        q_L: float | None = None,
+        q_C: float | None = None,
+        ref_freq_hz: float | None = None,
+    ) -> str:
         """
         输出一个简单的 2-port AC 仿真 netlist。
         """
@@ -43,10 +50,40 @@ class Circuit:
         lines.append(f"V1 {src_node} {gnd_node} AC 1")
         lines.append(f"Rload {out_node} {gnd_node} {self.z0}")
 
+        q_L_eff = float(q_L) if q_L is not None else None
+        q_C_eff = float(q_C) if q_C is not None else None
+        if q_L_eff is not None and (not np.isfinite(q_L_eff) or q_L_eff <= 0):
+            q_L_eff = None
+        if q_C_eff is not None and (not np.isfinite(q_C_eff) or q_C_eff <= 0):
+            q_C_eff = None
+
+        w_ref = None
+        if (q_L_eff is not None or q_C_eff is not None) and ref_freq_hz is not None:
+            w_ref = 2.0 * np.pi * float(ref_freq_hz)
+        if (q_L_eff is not None or q_C_eff is not None) and w_ref is None:
+            raise ValueError("ref_freq_hz is required when q_L/q_C are enabled for SPICE netlist generation.")
+
         for idx, comp in enumerate(self.components, start=1):
             name = f"{comp.ctype}{idx}"
-            value = f"{comp.value_si}"
+            value = float(comp.value_si)
+
+            if comp.ctype == "L" and q_L_eff is not None and w_ref is not None:
+                r_ser = (w_ref * value) / float(q_L_eff)
+                mid = f"q_{name}"
+                if r_ser > 0:
+                    lines.append(f"R{name}Q {comp.node1} {mid} {r_ser}")
+                else:
+                    mid = comp.node1
+                lines.append(f"{name} {mid} {comp.node2} {value}")
+                continue
+
             lines.append(f"{name} {comp.node1} {comp.node2} {value}")
+
+            if comp.ctype == "C" and q_C_eff is not None and w_ref is not None:
+                # Parallel resistor: Rp = Q / (ωC)
+                rp = float(q_C_eff) / (w_ref * value)
+                if rp > 0 and np.isfinite(rp):
+                    lines.append(f"R{name}Q {comp.node1} {comp.node2} {rp}")
 
         # 控制语句由调用者补充
         return "\n".join(lines)
@@ -56,6 +93,9 @@ def components_to_abcd(
     components: List[ComponentSpec],
     freq_hz: np.ndarray,
     z0: float,
+    *,
+    q_L: float | None = None,
+    q_C: float | None = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     omega = 2.0 * np.pi * freq_hz
     n = len(freq_hz)
@@ -67,18 +107,28 @@ def components_to_abcd(
     for comp in components:
         if comp.ctype == "L" and comp.role == "series":
             Z = 1j * omega * comp.value_si
+            if q_L is not None and q_L > 0:
+                Z = Z + (omega * comp.value_si) / float(q_L)
             B = A * Z + B
             D = C * Z + D
         elif comp.ctype == "C" and comp.role == "series":
-            Z = 1.0 / (1j * omega * comp.value_si + 1e-18)
+            Y = 1j * omega * comp.value_si
+            if q_C is not None and q_C > 0:
+                Y = Y + (omega * comp.value_si) / float(q_C)
+            Z = 1.0 / (Y + 1e-18)
             B = A * Z + B
             D = C * Z + D
         elif comp.ctype == "C" and comp.role == "shunt":
             Y = 1j * omega * comp.value_si
+            if q_C is not None and q_C > 0:
+                Y = Y + (omega * comp.value_si) / float(q_C)
             A = A + B * Y
             C = C + D * Y
         elif comp.ctype == "L" and comp.role == "shunt":
-            Y = 1.0 / (1j * omega * comp.value_si + 1e-18)
+            Z = 1j * omega * comp.value_si
+            if q_L is not None and q_L > 0:
+                Z = Z + (omega * comp.value_si) / float(q_L)
+            Y = 1.0 / (Z + 1e-18)
             A = A + B * Y
             C = C + D * Y
         else:
