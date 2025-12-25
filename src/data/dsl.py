@@ -1,5 +1,5 @@
 """
-VACT-DSL v2.1: ML-friendly IR with Macro / Repeat / Typed numeric slots.
+DSL: ML-friendly IR with Macro / Repeat / Typed numeric slots.
 
 Key ideas:
 - Canonical main program: <MAIN> Ports Body </MAIN>
@@ -62,6 +62,7 @@ MACRO_T_LCL = "<MAC_T_LCL>"
 MACRO_DOUBLE_SERIES_LC = "<MAC_DOUBLE_SERIES_LC>"
 MACRO_DOUBLE_SHUNT_LC = "<MAC_DOUBLE_SHUNT_LC>"
 MACRO_BRIDGE_C = "<MAC_BRIDGE_C>"
+MACRO_CELL_BS_PAR_SER_LC = "<MAC_CELL_BS_PAR_SER_LC>"
 
 MACRO_IDS = [
     MACRO_CELL_LS_CS,
@@ -74,6 +75,7 @@ MACRO_IDS = [
     MACRO_DOUBLE_SERIES_LC,
     MACRO_DOUBLE_SHUNT_LC,
     MACRO_BRIDGE_C,
+    MACRO_CELL_BS_PAR_SER_LC,
 ]
 
 
@@ -166,6 +168,19 @@ def _expand_bridge_c(a: str, b: str, gnd: str, vals: List[float], inst_idx: int 
     return [ComponentSpec("C", "series", C_val, None, a, b)]
 
 
+def _expand_cell_bs_par_ser_lc(a: str, b: str, gnd: str, vals: List[float], inst_idx: int = 0) -> List[ComponentSpec]:
+    # Series path: parallel LC between a and b.
+    # Shunt path: series LC from b to gnd via internal node.
+    Lp, Cp, Ls, Cs = (vals + [0.0, 0.0, 0.0, 0.0])[:4]
+    x = f"x{inst_idx}_0"
+    return [
+        ComponentSpec("L", "series", Lp, None, a, b),
+        ComponentSpec("C", "series", Cp, None, a, b),
+        ComponentSpec("L", "series", Ls, None, b, x),
+        ComponentSpec("C", "series", Cs, None, x, gnd),
+    ]
+
+
 MACRO_LIBRARY: Dict[str, MacroDef] = {
     MACRO_CELL_LS_CS: MacroDef(MACRO_CELL_LS_CS, ("L", "C"), _expand_cell_ls_cs),
     MACRO_CELL_CS_LS: MacroDef(MACRO_CELL_CS_LS, ("C", "L"), _expand_cell_cs_ls),
@@ -177,6 +192,7 @@ MACRO_LIBRARY: Dict[str, MacroDef] = {
     MACRO_DOUBLE_SERIES_LC: MacroDef(MACRO_DOUBLE_SERIES_LC, ("L", "C"), _expand_double_series_lc),
     MACRO_DOUBLE_SHUNT_LC: MacroDef(MACRO_DOUBLE_SHUNT_LC, ("L", "C"), _expand_double_shunt_lc),
     MACRO_BRIDGE_C: MacroDef(MACRO_BRIDGE_C, ("C",), _expand_bridge_c),
+    MACRO_CELL_BS_PAR_SER_LC: MacroDef(MACRO_CELL_BS_PAR_SER_LC, ("L_PAR", "C_PAR", "L_SER", "C_SER"), _expand_cell_bs_par_ser_lc),
 }
 
 # Slot type -> token mapping (kept centralized to avoid drift across encoder/decoder/mask).
@@ -186,13 +202,17 @@ SLOT_TYPE_TO_TOKEN = {
     "R": VAL_R,
     "TL_Z0": VAL_TL_Z0,
     "TL_LEN": VAL_TL_LEN,
+    "L_PAR": VAL_L,
+    "C_PAR": VAL_C,
+    "L_SER": VAL_L,
+    "C_SER": VAL_C,
 }
 
 
 # ---- Vocab builder ----
 
 
-def build_dslv2_vocab(
+def build_dsl_vocab(
     *,
     macro_ids: Sequence[str] | None = None,
     include_bos: bool = True,
@@ -217,7 +237,7 @@ def build_dslv2_vocab(
 # ---- Encoding (components -> tokens) ----
 
 
-def components_to_dslv2_tokens(
+def components_to_dsl_tokens(
     components: Sequence[ComponentSpec],
     *,
     macro_name: str = MACRO_CELL_LS_CS,
@@ -227,7 +247,7 @@ def components_to_dslv2_tokens(
     include_bos: bool = True,
 ) -> Tuple[List[str], List[float]]:
     """
-    Convert components (or explicit macro segments) into DSL v2 tokens.
+    Convert components (or explicit macro segments) into DSL tokens.
     Returns (tokens, slot_values) where slot_values aligns to tokens (nan when not a slot).
     - segments: optional explicit [(macro_name, [cell_vals...]), ...]; if provided, components are ignored.
     - use_varint_k: encode K with <K> D_* </K> to allow large/unbounded repeat counts.
@@ -247,6 +267,87 @@ def components_to_dslv2_tokens(
         else:
             tokens_out.append(f"<K_{k}>")
             slot_out.append(float("nan"))
+
+    def _detect_shunt_series_lc(comps: Sequence[ComponentSpec]) -> Tuple[Dict[str, Tuple[float, float]], Set[int]]:
+        node_to_series: Dict[str, List[Tuple[int, ComponentSpec]]] = {}
+        for idx, c in enumerate(comps):
+            if c.role != "series":
+                continue
+            node_to_series.setdefault(c.node1, []).append((idx, c))
+            node_to_series.setdefault(c.node2, []).append((idx, c))
+        out: Dict[str, Tuple[float, float]] = {}
+        branch_ids: Set[int] = set()
+        for node, items in node_to_series.items():
+            if node == "gnd":
+                continue
+            if len(items) != 2:
+                continue
+            (i1, c1), (i2, c2) = items
+            o1 = c1.node2 if c1.node1 == node else c1.node1
+            o2 = c2.node2 if c2.node1 == node else c2.node1
+            c1_to_gnd = o1 == "gnd"
+            c2_to_gnd = o2 == "gnd"
+            if c1_to_gnd == c2_to_gnd:
+                continue
+            comp_to_gnd = c1 if c1_to_gnd else c2
+            comp_to_anchor = c2 if c1_to_gnd else c1
+            anchor = comp_to_anchor.node2 if comp_to_anchor.node1 == node else comp_to_anchor.node1
+            if anchor == "gnd":
+                continue
+            types = {comp_to_gnd.ctype, comp_to_anchor.ctype}
+            if types != {"L", "C"}:
+                continue
+            L_val = comp_to_gnd.value_si if comp_to_gnd.ctype == "L" else comp_to_anchor.value_si
+            C_val = comp_to_gnd.value_si if comp_to_gnd.ctype == "C" else comp_to_anchor.value_si
+            out[anchor] = (float(L_val), float(C_val))
+            branch_ids.update([i1, i2])
+        return out, branch_ids
+
+    def _build_bs_cells(comps: Sequence[ComponentSpec]) -> List[List[float]]:
+        # Identify series connections (non-gnd) and derive the main path.
+        shunt_series, branch_comp_ids = _detect_shunt_series_lc(comps)
+        series_pairs: Dict[Tuple[str, str], List[ComponentSpec]] = {}
+        for idx, c in enumerate(comps):
+            if idx in branch_comp_ids:
+                continue
+            if c.role != "series":
+                continue
+            if c.node1 == "gnd" or c.node2 == "gnd":
+                continue
+            key = tuple(sorted((c.node1, c.node2)))
+            series_pairs.setdefault(key, []).append(c)
+        series_adj: Dict[str, List[str]] = {}
+        for (n1, n2) in series_pairs.keys():
+            series_adj.setdefault(n1, []).append(n2)
+            series_adj.setdefault(n2, []).append(n1)
+        if "in" not in series_adj or "out" not in series_adj:
+            return []
+        path_nodes = ["in"]
+        prev = None
+        current = "in"
+        while current != "out":
+            neighbors = [n for n in series_adj.get(current, []) if n != prev]
+            if len(neighbors) != 1:
+                return []
+            nxt = neighbors[0]
+            path_nodes.append(nxt)
+            prev, current = current, nxt
+
+        vals_per_cell: List[List[float]] = []
+        for i in range(len(path_nodes) - 1):
+            a = path_nodes[i]
+            b = path_nodes[i + 1]
+            key = tuple(sorted((a, b)))
+            Lp = 0.0
+            Cp = 0.0
+            for c in series_pairs.get(key, []):
+                if c.ctype == "L":
+                    Lp = float(c.value_si)
+                elif c.ctype == "C":
+                    Cp = float(c.value_si)
+            Ls, Cs = shunt_series.get(b, (0.0, 0.0))
+            vals_per_cell.append([Lp, Cp, Ls, Cs])
+        return vals_per_cell
 
     tokens: List[str] = []
     if include_bos:
@@ -300,37 +401,43 @@ def components_to_dslv2_tokens(
             else:
                 _emit_repeat(macro_id, cell_vals)
     else:
-        macro = MACRO_LIBRARY[macro_name]
-        # Heuristic: derive K from number of series components along main path (non-gnd).
-        series = [c for c in components if c.role == "series" and c.node1 != "gnd" and c.node2 != "gnd"]
-        K = max(1, len(series))
-        # Collect slot values per cell from components: greedy by series/shunt ordering.
-        vals_per_cell: List[List[float]] = []
-        shunt_map: Dict[str, ComponentSpec] = {c.node1: c for c in components if c.role == "shunt"}
-        for c in series:
-            vals = []
-            for t in macro.slot_types:
-                if t == "L":
-                    if c.ctype == "L":
-                        vals.append(float(c.value_si))
+        if macro_name == MACRO_CELL_BS_PAR_SER_LC:
+            vals_per_cell = _build_bs_cells(components)
+            if not vals_per_cell:
+                vals_per_cell = [[0.0, 0.0, 0.0, 0.0]]
+            _emit_repeat(macro_name, vals_per_cell)
+        else:
+            macro = MACRO_LIBRARY[macro_name]
+            # Heuristic: derive K from number of series components along main path (non-gnd).
+            series = [c for c in components if c.role == "series" and c.node1 != "gnd" and c.node2 != "gnd"]
+            K = max(1, len(series))
+            # Collect slot values per cell from components: greedy by series/shunt ordering.
+            vals_per_cell = []
+            shunt_map: Dict[str, ComponentSpec] = {c.node1: c for c in components if c.role == "shunt"}
+            for c in series:
+                vals = []
+                for t in macro.slot_types:
+                    if t == "L":
+                        if c.ctype == "L":
+                            vals.append(float(c.value_si))
+                        else:
+                            sh = shunt_map.get(c.node2)
+                            vals.append(float(sh.value_si) if sh and sh.ctype == "L" else 0.0)
+                    elif t == "C":
+                        if c.ctype == "C":
+                            vals.append(float(c.value_si))
+                        else:
+                            sh = shunt_map.get(c.node2)
+                            vals.append(float(sh.value_si) if sh and sh.ctype == "C" else 0.0)
                     else:
-                        sh = shunt_map.get(c.node2)
-                        vals.append(float(sh.value_si) if sh and sh.ctype == "L" else 0.0)
-                elif t == "C":
-                    if c.ctype == "C":
-                        vals.append(float(c.value_si))
-                    else:
-                        sh = shunt_map.get(c.node2)
-                        vals.append(float(sh.value_si) if sh and sh.ctype == "C" else 0.0)
-                else:
-                    vals.append(0.0)
-            vals_per_cell.append(vals)
+                        vals.append(0.0)
+                vals_per_cell.append(vals)
 
-        while len(vals_per_cell) < K:
-            vals_per_cell.append([0.0] * len(macro.slot_types))
-        vals_per_cell = vals_per_cell[:K]
+            while len(vals_per_cell) < K:
+                vals_per_cell.append([0.0] * len(macro.slot_types))
+            vals_per_cell = vals_per_cell[:K]
 
-        _emit_repeat(macro_name, vals_per_cell)
+            _emit_repeat(macro_name, vals_per_cell)
 
     tokens.append(MAIN_END)
     slot_values.append(float("nan"))
@@ -342,13 +449,13 @@ def components_to_dslv2_tokens(
 # ---- Decoding (tokens -> components) ----
 
 
-def dslv2_tokens_to_components(
+def dsl_tokens_to_components(
     tokens: Sequence[str],
     *,
     slot_values: Sequence[float] | None = None,
 ) -> List[ComponentSpec]:
     """
-    Parse DSL v2 tokens into ComponentSpec list. slot_values should align with tokens;
+    Parse DSL tokens into ComponentSpec list. slot_values should align with tokens;
     if absent, slots are filled with 0.0.
     """
     toks = list(tokens)
@@ -479,7 +586,7 @@ def dslv2_tokens_to_components(
 # ---- Grammar mask ----
 
 
-def make_dslv2_prefix_allowed_tokens_fn(tokenizer) -> Callable[[int, List[int]], List[int]]:
+def make_dsl_prefix_allowed_tokens_fn(tokenizer) -> Callable[[int, List[int]], List[int]]:
     vocab = tokenizer.get_vocab()
     all_ids = list(vocab.values())
 
@@ -799,16 +906,16 @@ def make_dslv2_prefix_allowed_tokens_fn(tokenizer) -> Callable[[int, List[int]],
     return _prefix_allowed_tokens_fn
 
 
-def dslv2_tokens_to_action_tokens(
+def dsl_tokens_to_action_tokens(
     tokens: Sequence[str],
     *,
     slot_values: Sequence[float] | None = None,
 ) -> List[str]:
     """
-    Convenience: DSL v2 tokens (+slots) -> ComponentSpec -> Action tokens.
+    Convenience: DSL tokens (+slots) -> ComponentSpec -> Action tokens.
     Useful for dual-IR supervision or post-hoc compilation to ActionVACT.
     """
-    comps = dslv2_tokens_to_components(tokens, slot_values=slot_values)
+    comps = dsl_tokens_to_components(tokens, slot_values=slot_values)
     return components_to_action_tokens(
         [
             ComponentSpec(c.ctype, c.role, c.value_si, c.std_label, c.node1, c.node2)

@@ -143,6 +143,20 @@ class DifferentiableRFTests(unittest.TestCase):
         s21_db_t = circuit(torch.tensor(freq_hz, dtype=torch.float64), output="s21_db").detach().cpu().numpy()
         np.testing.assert_allclose(s21_db_t, s21_db_nodal, rtol=0, atol=1e-6)
 
+    def test_series_parallel_lc_matches_nodal(self):
+        comps = [
+            ComponentSpec("L", "series", 8.2e-9, None, "in", "out"),
+            ComponentSpec("C", "series", 1.5e-12, None, "in", "out"),
+        ]
+        freq_hz = np.logspace(7, 9, 96)
+        S = components_to_sparams_nodal(comps, freq_hz, z0=50.0)
+        s21_db_nodal = 20.0 * np.log10(np.abs(S[:, 1, 0]) + 1e-12)
+
+        assembler = DynamicCircuitAssembler(z0=50.0)
+        circuit, _ = assembler.assemble(comps, trainable=False, q_L=None, q_C=None, eps=1e-18, dtype=torch.float64)
+        s21_db_t = circuit(torch.tensor(freq_hz, dtype=torch.float64), output="s21_db").detach().cpu().numpy()
+        np.testing.assert_allclose(s21_db_t, s21_db_nodal, rtol=0, atol=1e-6)
+
 
 if __name__ == "__main__":
     unittest.main()

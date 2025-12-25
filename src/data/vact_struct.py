@@ -1,5 +1,5 @@
 """
-VACT-DSL: a composable, execution-oriented IR for LC circuits.
+VACT-Struct: a composable, execution-oriented IR for LC circuits.
 
 Design goals (paper-facing):
 - composable: explicit <CIRCUIT>/<CELL> blocks (optionally hierarchical tags later)
@@ -20,7 +20,7 @@ from .vact_codec import (
 )
 
 
-# ---- VACT-DSL structural tokens (avoid collision with VACT role tokens) ----
+# ---- VACT-Struct structural tokens (avoid collision with VACT role tokens) ----
 
 CIRCUIT_START = "<CIRCUIT>"
 CIRCUIT_END = "</CIRCUIT>"
@@ -78,7 +78,7 @@ _STRUCT_TOKENS: Set[str] = {
 }
 
 
-def components_to_vactdsl_tokens(
+def components_to_vact_struct_tokens(
     components: List[ComponentSpec],
     *,
     z0: float = 50.0,
@@ -87,7 +87,7 @@ def components_to_vactdsl_tokens(
     emit_device_blocks: bool = False,
 ) -> List[str]:
     """
-    Encode components into a VACT-DSL token sequence.
+    Encode components into a VACT-Struct token sequence.
 
     Notes:
     - Internally uses VACT 5-token components for maximal backward compatibility.
@@ -164,7 +164,7 @@ def components_to_vactdsl_tokens(
     return tokens
 
 
-def _strip_vactdsl_non_component_tokens(tokens: Iterable[str]) -> List[str]:
+def _strip_vact_struct_non_component_tokens(tokens: Iterable[str]) -> List[str]:
     cleaned: List[str] = []
     for tok in tokens:
         if tok in _STRUCT_TOKENS:
@@ -173,30 +173,30 @@ def _strip_vactdsl_non_component_tokens(tokens: Iterable[str]) -> List[str]:
     return cleaned
 
 
-def vactdsl_tokens_to_components(
+def vact_struct_tokens_to_components(
     tokens: List[str],
     label_to_value: Mapping[str, float] | None = None,
     *,
     drop_non_component_tokens: bool = True,
 ) -> List[ComponentSpec]:
     """
-    Decode VACT-DSL tokens back to components.
+    Decode VACT-Struct tokens back to components.
     When drop_non_component_tokens=True, structure tokens are ignored and the sequence
     degrades to the original VACT format.
     """
     if drop_non_component_tokens:
-        tokens = _strip_vactdsl_non_component_tokens(tokens)
+        tokens = _strip_vact_struct_non_component_tokens(tokens)
     return vact_tokens_to_components(tokens, label_to_value=label_to_value, drop_non_component_tokens=True)
 
 
-def build_vactdsl_vocab(
+def build_vact_struct_vocab(
     value_labels: Sequence[str],
     node_names: Sequence[str] = ("in", "out", "gnd") + tuple(f"n{k}" for k in range(16)),
     order_range: tuple[int, int] | None = (2, 7),
     include_ports: bool = True,
 ) -> List[str]:
     """
-    Build a tokenizer vocab that supports VACT-DSL + the original VACT tokens.
+    Build a tokenizer vocab that supports VACT-Struct + the original VACT tokens.
     """
     vocab = set(components_to_vact_tokens([]))  # empty list -> []
     # Reuse VACT's vocab builder via components tokens generation is not enough; import directly.
@@ -230,7 +230,7 @@ def build_vactdsl_vocab(
     return sorted(vocab)
 
 
-def make_vactdsl_prefix_allowed_tokens_fn(
+def make_vact_struct_prefix_allowed_tokens_fn(
     tokenizer,
     *,
     require_ports: bool = False,
@@ -238,7 +238,7 @@ def make_vactdsl_prefix_allowed_tokens_fn(
     allow_device_blocks: bool = False,
 ) -> "callable":
     """
-    Prefix constraint for VACT-DSL decoding.
+    Prefix constraint for VACT-Struct decoding.
 
     Grammar (simplified):
       (<ORDER_k>)* <SEP>* <CIRCUIT>

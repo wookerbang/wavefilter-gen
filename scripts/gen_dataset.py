@@ -25,6 +25,12 @@ def parse_args() -> argparse.Namespace:
         help="Use ngspice for wave simulation when possible (otherwise fall back to Fast Track).",
     )
     p.add_argument("--seed", type=int, default=42, help="Random seed for spec sampling.")
+    p.add_argument(
+        "--scenario",
+        type=str,
+        default="random",
+        help="Scenario template (general/anti_jamming/coexistence/wideband_rejection/random_basic) or 'random'.",
+    )
     p.add_argument("--q", type=float, default=50.0, help="Finite-Q loss model (applied to both L and C unless overridden).")
     p.add_argument("--q-l", type=float, default=None, help="Override Q for inductors (None -> use --q).")
     p.add_argument("--q-c", type=float, default=None, help="Override Q for capacitors (None -> use --q).")
@@ -39,15 +45,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vact-cell", dest="vact_cell", action="store_true", help="Insert <CELL> markers in VACT.")
     p.add_argument("--no-vact-cell", dest="vact_cell", action="store_false", help="Disable <CELL> markers in VACT.")
     p.set_defaults(vact_cell=True)
-    p.add_argument("--vactdsl", dest="vactdsl", action="store_true", help="Emit VACT-DSL tokens (default: on).")
-    p.add_argument("--no-vactdsl", dest="vactdsl", action="store_false", help="Disable VACT-DSL token emission.")
-    p.set_defaults(vactdsl=True)
+    p.add_argument("--vact-struct", dest="vact_struct", action="store_true", help="Emit VACT-Struct tokens (default: on).")
+    p.add_argument("--no-vact-struct", dest="vact_struct", action="store_false", help="Disable VACT-Struct token emission.")
+    p.add_argument("--vactdsl", dest="vact_struct", action="store_true", help="(Deprecated) Emit VACT-Struct tokens.")
+    p.add_argument("--no-vactdsl", dest="vact_struct", action="store_false", help="(Deprecated) Disable VACT-Struct token emission.")
+    p.set_defaults(vact_struct=True)
     p.add_argument("--actions", dest="actions", action="store_true", help="Emit action-construction tokens (default: on).")
     p.add_argument("--no-actions", dest="actions", action="store_false", help="Disable action-construction tokens.")
     p.set_defaults(actions=True)
-    p.add_argument("--dslv2", dest="dslv2", action="store_true", help="Emit VACT-DSL v2 tokens (macro/repeat).")
-    p.add_argument("--no-dslv2", dest="dslv2", action="store_false", help="Disable VACT-DSL v2 tokens.")
-    p.set_defaults(dslv2=True)
+    p.add_argument("--dsl", dest="dsl", action="store_true", help="Emit DSL tokens (macro/repeat).")
+    p.add_argument("--no-dsl", dest="dsl", action="store_false", help="Disable DSL token emission.")
+    p.add_argument("--dslv2", dest="dsl", action="store_true", help="(Deprecated) Emit DSL tokens.")
+    p.add_argument("--no-dslv2", dest="dsl", action="store_false", help="(Deprecated) Disable DSL token emission.")
+    p.set_defaults(dsl=True)
     p.add_argument("--max-nodes", type=int, default=32, help="Max internal nodes after canonicalization (n1..nK).")
     return p.parse_args()
 
@@ -62,10 +72,11 @@ def main() -> None:
         split=args.split,
         use_ngspice=bool(args.use_ngspice),
         seed=args.seed,
+        scenario=str(args.scenario),
         emit_vact_cells=bool(args.vact_cell),
-        emit_vactdsl=bool(args.vactdsl),
+        emit_vact_struct=bool(args.vact_struct),
         emit_actions=bool(args.actions),
-        emit_dslv2=bool(args.dslv2),
+        emit_dsl=bool(args.dsl),
         max_nodes=int(args.max_nodes),
         q_L=q_l,
         q_C=q_c,

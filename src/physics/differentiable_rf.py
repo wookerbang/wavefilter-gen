@@ -47,6 +47,7 @@ class DifferentiablePhysicsKernel:
     OP_SHUNT_L = 2
     OP_SHUNT_C = 3
     OP_SHUNT_SERIES_LC = 4
+    OP_SERIES_PARALLEL_LC = 5
 
     @staticmethod
     def omega(freq_hz: torch.Tensor) -> torch.Tensor:
@@ -298,6 +299,33 @@ class DifferentiablePhysicsKernel:
                 Y = 1.0 / (Z_L + Z_C + eps)
                 A = A + B * Y
                 C = C + D * Y
+            elif code == DifferentiablePhysicsKernel.OP_SERIES_PARALLEL_LC:
+                if v.shape[-1] != 2:
+                    raise ValueError("OP_SERIES_PARALLEL_LC expects 2 parameters (L, C).")
+                L_val = v[..., 0].unsqueeze(-1)
+                C_val = v[..., 1].unsqueeze(-1)
+                Z_L = DifferentiablePhysicsKernel.series_impedance(
+                    L_val,
+                    omega,
+                    kind="L",
+                    eps=eps,
+                    q=ql,
+                    q_model=q_model,
+                    ref_omega=ref_omega,
+                )
+                Z_C = DifferentiablePhysicsKernel.series_impedance(
+                    C_val,
+                    omega,
+                    kind="C",
+                    eps=eps,
+                    q=qc,
+                    q_model=q_model,
+                    ref_omega=ref_omega,
+                )
+                Y = 1.0 / (Z_L + eps) + 1.0 / (Z_C + eps)
+                Z_eq = 1.0 / (Y + eps)
+                B = A * Z_eq + B
+                D = C * Z_eq + D
             else:
                 raise ValueError(f"Unknown op code: {code}")
 
@@ -595,8 +623,8 @@ class DynamicCircuitAssembler:
             branches_by_anchor.setdefault(anchor, []).append((L_idx, C_idx))
             branch_comp_ids.update([i1, i2])
 
-        # Build series adjacency (excluding branch components).
-        series_adj: dict[str, list[tuple[str, int]]] = {}
+        # Detect series-parallel LC (two series components between same nodes).
+        series_pairs: dict[tuple[str, str], list[int]] = {}
         for idx, c in enumerate(comps):
             if idx in branch_comp_ids:
                 continue
@@ -604,8 +632,43 @@ class DynamicCircuitAssembler:
                 continue
             if c.node1 == gnd or c.node2 == gnd:
                 continue
-            series_adj.setdefault(c.node1, []).append((c.node2, idx))
-            series_adj.setdefault(c.node2, []).append((c.node1, idx))
+            key = tuple(sorted((c.node1, c.node2)))
+            series_pairs.setdefault(key, []).append(idx)
+
+        parallel_series: dict[tuple[str, str], tuple[int, int]] = {}
+        parallel_ids: set[int] = set()
+        for key, idxs in series_pairs.items():
+            if len(idxs) != 2:
+                continue
+            types = {comps[i].ctype for i in idxs}
+            if types != {"L", "C"}:
+                continue
+            L_idx = idxs[0] if comps[idxs[0]].ctype == "L" else idxs[1]
+            C_idx = idxs[0] if comps[idxs[0]].ctype == "C" else idxs[1]
+            parallel_series[key] = (L_idx, C_idx)
+            parallel_ids.update(idxs)
+
+        # Build series adjacency (excluding branch + folded parallel components).
+        series_edges: list[tuple[str, str, str, list[int]]] = []
+        series_adj: dict[str, list[tuple[str, int]]] = {}
+
+        def _add_edge(n1: str, n2: str, kind: str, comp_indices: list[int]) -> None:
+            edge_id = len(series_edges)
+            series_edges.append((n1, n2, kind, comp_indices))
+            series_adj.setdefault(n1, []).append((n2, edge_id))
+            series_adj.setdefault(n2, []).append((n1, edge_id))
+
+        for (n1, n2), (l_idx, c_idx) in parallel_series.items():
+            _add_edge(n1, n2, "parallel_lc", [l_idx, c_idx])
+
+        for idx, c in enumerate(comps):
+            if idx in branch_comp_ids or idx in parallel_ids:
+                continue
+            if c.role != "series":
+                continue
+            if c.node1 == gnd or c.node2 == gnd:
+                continue
+            _add_edge(c.node1, c.node2, "single", [idx])
 
         if port_in not in series_adj or port_out not in series_adj:
             return None
@@ -619,11 +682,11 @@ class DynamicCircuitAssembler:
             neighbors = [item for item in series_adj.get(current, []) if item[0] != prev]
             if len(neighbors) != 1:
                 return None
-            next_node, comp_idx = neighbors[0]
-            if comp_idx in visited_edges:
+            next_node, edge_id = neighbors[0]
+            if edge_id in visited_edges:
                 return None
-            visited_edges.add(comp_idx)
-            path_series.append(comp_idx)
+            visited_edges.add(edge_id)
+            path_series.append(edge_id)
             path_nodes.append(next_node)
             prev, current = current, next_node
 
@@ -656,10 +719,17 @@ class DynamicCircuitAssembler:
                 op_param_counts.append(2)
                 value_comp_indices.extend([l_idx, c_idx])
             if i < len(path_series):
-                s_idx = path_series[i]
-                op_codes.append(self._op_code_for(comps[s_idx]))
-                op_param_counts.append(1)
-                value_comp_indices.append(s_idx)
+                edge_id = path_series[i]
+                _, _, kind, comp_indices = series_edges[edge_id]
+                if kind == "parallel_lc":
+                    op_codes.append(DifferentiablePhysicsKernel.OP_SERIES_PARALLEL_LC)
+                    op_param_counts.append(2)
+                    value_comp_indices.extend(comp_indices)
+                else:
+                    s_idx = comp_indices[0]
+                    op_codes.append(self._op_code_for(comps[s_idx]))
+                    op_param_counts.append(1)
+                    value_comp_indices.append(s_idx)
 
         if not op_codes:
             return None

@@ -1,58 +1,61 @@
 """
-原型滤波器生成 + 理想波形计算。
+原型滤波器生成 + 理想波形计算（工具化接口）。
 
-当前支持 Chebyshev Type I 与 Butterworth 原型，滤波器形状以低通为主，可扩展到 HP/BP。
+支持 Chebyshev Type I 与 Butterworth 原型，覆盖 LP/HP/BP/BS。
+Scenario 层应负责具体任务簇采样与后处理（例如 notch）。
 """
 
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Literal, Tuple
+from typing import Dict, Iterable, List, Literal, Sequence, Tuple
 
 import numpy as np
 
 from .schema import ComponentSpec
 
 
-def sample_filter_spec(rng: np.random.Generator | None = None) -> Dict[str, object]:
+def sample_base_spec(
+    *,
+    rng: np.random.Generator | None = None,
+    filter_type: Literal["lowpass", "highpass", "bandpass", "bandstop"] | Sequence[str] = "lowpass",
+    order_range: Tuple[int, int] = (3, 7),
+    fc_range_hz: Tuple[float, float] = (1e8, 5e9),
+    ripple_db_range: Tuple[float, float] = (0.1, 0.5),
+    prototype_types: Sequence[str] = ("cheby1", "butter"),
+    topology_types: Sequence[str] = ("pi", "t"),
+    bw_frac_range: Tuple[float, float] = (0.05, 0.3),
+    z0: float = 50.0,
+) -> Dict[str, object]:
     """
-    随机采样一条设计规格。
-    默认低通；原型在 cheby1 / butter 之间采样。
-    可选场景：基础 / notch / dual-band（dual 仅用于生成测试集时可控）。
+    采样一个“基础滤波器”规格（不包含任务场景/后处理）。
+    Scenario 层应在此基础上补充场景字段（如 notch 频点、非对称约束等）。
     """
     rng = rng or np.random.default_rng()
-    # 低通为主，少量采样 bandpass，用于后续 dual-band 组合
-    filter_type = rng.choice(["lowpass", "bandpass"], p=[0.8, 0.2]).item()
-    # 主要分布 3-8 阶，偶尔露出 2/9 阶做泛化测试
-    p = rng.random()
-    if p < 0.05:
-        order = 2
-    elif p > 0.95:
-        order = 9
+    if isinstance(filter_type, str):
+        ftype = filter_type
     else:
-        order = int(rng.integers(3, 9))
-    fc = float(10 ** rng.uniform(8.0, 9.7))  # 100MHz ~ 5GHz
-    ripple_db = float(rng.uniform(0.1, 0.5))
-    z0 = 50.0
-    topology_type = rng.choice(["pi", "t"]).item()
-    prototype_type = rng.choice(["cheby1", "butter"]).item()
-    scenario = rng.choice(["base", "notch", "dualband"], p=[0.7, 0.2, 0.1]).item()
-    bw_frac = float(rng.uniform(0.05, 0.3)) if filter_type == "bandpass" else None
-    fc2 = None
-    if scenario == "dualband":
-        # 第二个通带中心频率，避免过近
-        fc2 = fc * float(10 ** rng.uniform(0.2, 0.6))
+        ftype = rng.choice(list(filter_type)).item()
+    order_lo, order_hi = (int(order_range[0]), int(order_range[1]))
+    order = int(rng.integers(order_lo, order_hi + 1))
+    fc = float(10 ** rng.uniform(np.log10(float(fc_range_hz[0])), np.log10(float(fc_range_hz[1]))))
+    ripple_db = float(rng.uniform(float(ripple_db_range[0]), float(ripple_db_range[1])))
+    prototype_type = rng.choice(list(prototype_types)).item()
+    topology_type = rng.choice(list(topology_types)).item()
+    if ftype == "bandstop" and "t" in topology_types:
+        topology_type = "t"
+    bw_frac = None
+    if ftype in ("bandpass", "bandstop"):
+        bw_frac = float(rng.uniform(float(bw_frac_range[0]), float(bw_frac_range[1])))
     return {
-        "filter_type": filter_type,
+        "filter_type": ftype,
         "prototype_type": prototype_type,
         "order": order,
         "fc_hz": fc,
-        "fc2_hz": fc2,
         "bw_frac": bw_frac,
-        "z0": z0,
+        "z0": float(z0),
         "ripple_db": ripple_db,
         "topology_type": topology_type,
-        "scenario": scenario,
     }
 
 
@@ -234,6 +237,55 @@ def denormalize_bandpass_to_LC(
     return comps
 
 
+def denormalize_bandstop_to_LC(
+    g_values: np.ndarray,
+    fc_hz: float,
+    z0: float,
+    fbw: float,
+    topology_type: Literal["pi", "t"] = "pi",
+) -> List[ComponentSpec]:
+    """
+    低通原型 -> 带阻变换（窄带近似）：
+      - series 元件 -> 并联 LC（串在主路）
+      - shunt 元件 -> 串联 LC（接地支路）
+    """
+    w0 = 2.0 * math.pi * fc_hz
+    comps: List[ComponentSpec] = []
+    g_body = g_values[1:-1]
+    n = len(g_body)
+    if topology_type == "pi":
+        num_series = n // 2
+    else:
+        num_series = (n + 1) // 2
+    main_nodes = ["in"] + [f"n{k}" for k in range(1, num_series)] + ["out"]
+    series_seen = 0
+    shunt_counter = 0
+
+    for idx, g in enumerate(g_body, start=1):
+        if g <= 0:
+            continue
+        is_shunt = (topology_type == "pi" and idx % 2 == 1) or (topology_type == "t" and idx % 2 == 0)
+        if is_shunt:
+            # shunt: series LC to gnd
+            Ls = z0 * fbw / (w0 * g)
+            Cs = g / (w0 * z0 * fbw)
+            node = main_nodes[series_seen]
+            mid_node = f"bs_mid{shunt_counter}"
+            shunt_counter += 1
+            comps.append(ComponentSpec("L", "series", Ls, None, node, mid_node))
+            comps.append(ComponentSpec("C", "series", Cs, None, mid_node, "gnd"))
+        else:
+            # series: parallel LC across main path
+            Lp = z0 * g / (w0 * fbw)
+            Cp = fbw / (w0 * z0 * g)
+            start_node = main_nodes[series_seen]
+            end_node = main_nodes[series_seen + 1]
+            comps.append(ComponentSpec("L", "series", Lp, None, start_node, end_node))
+            comps.append(ComponentSpec("C", "series", Cp, None, start_node, end_node))
+            series_seen += 1
+    return comps
+
+
 def synthesize_filter(spec: Dict[str, object]) -> List[ComponentSpec]:
     """根据 filter_type/prototype_type 将原型 g 值映射到具体 LC 电路。"""
     g = get_g_values(spec["order"], spec["ripple_db"], prototype_type=spec["prototype_type"])
@@ -245,8 +297,44 @@ def synthesize_filter(spec: Dict[str, object]) -> List[ComponentSpec]:
     if ftype == "bandpass":
         fbw = float(spec.get("bw_frac") or 0.2)
         return denormalize_bandpass_to_LC(g, spec["fc_hz"], spec["z0"], fbw, spec["topology_type"])
+    if ftype == "bandstop":
+        fbw = float(spec.get("bw_frac") or spec.get("stopband_bw_frac") or 0.2)
+        return denormalize_bandstop_to_LC(g, spec["fc_hz"], spec["z0"], fbw, spec["topology_type"])
     # 回退：按低通处理
     return denormalize_lowpass_to_LC(g, spec["fc_hz"], spec["z0"], spec["topology_type"])
+
+
+def pick_anchor_node(components: Iterable[ComponentSpec]) -> str:
+    nodes: List[str] = []
+    for c in components:
+        nodes.extend([c.node1, c.node2])
+    candidates = [n for n in set(nodes) if n not in ("gnd", "out")]
+    return candidates[0] if candidates else "in"
+
+
+def insert_shunt_series_lc(
+    components: Iterable[ComponentSpec],
+    *,
+    anchor: str | None = None,
+    notch_freq_hz: float,
+    rng: np.random.Generator | None = None,
+    c_range_pf: Tuple[float, float] = (0.5, 5.0),
+    mid_prefix: str = "notch",
+) -> Tuple[List[ComponentSpec], float, float, str]:
+    """
+    在给定 anchor 节点挂一个串联 LC 到地（用于 notch）。
+    返回 (new_components, L_value, C_value, anchor_node)。
+    """
+    rng = rng or np.random.default_rng()
+    comps = list(components)
+    anchor_node = anchor or pick_anchor_node(comps)
+    c_min, c_max = float(c_range_pf[0]), float(c_range_pf[1])
+    Cn = 1e-12 * float(rng.uniform(c_min, c_max))
+    Ln = 1.0 / ((2 * math.pi * float(notch_freq_hz)) ** 2 * Cn)
+    mid_node = f"{anchor_node}_{mid_prefix}"
+    comps.append(ComponentSpec("L", "series", Ln, None, anchor_node, mid_node))
+    comps.append(ComponentSpec("C", "series", Cn, None, mid_node, "gnd"))
+    return comps, float(Ln), float(Cn), anchor_node
 
 
 def compute_ideal_waveform(

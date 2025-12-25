@@ -11,19 +11,17 @@ from typing import List
 import numpy as np
 import torch
 
-from .gen_prototype import (
-    sample_filter_spec,
-    synthesize_filter,
-)
+from .gen_prototype import synthesize_filter
 from .quantization import quantize_components
 from .schema import ComponentSpec, FilterSample
 from .vact_codec import components_to_vact_tokens
 from .sfci_net_codec import components_to_sfci_net_tokens
 from .spice_runner import simulate_real_waveform
-from .dsl_codec import components_to_vactdsl_tokens
+from .vact_struct import components_to_vact_struct_tokens
 from .node_canonicalizer import canonicalize_nodes
 from .action_codec import components_to_action_tokens
-from .dsl_v2 import components_to_dslv2_tokens
+from .dsl import MACRO_CELL_BS_PAR_SER_LC, MACRO_CELL_CS_LS, components_to_dsl_tokens
+from .scenarios import apply_scenario_postprocess, build_freq_grid, build_spec_masks, sample_scenario_spec
 from src.physics import FastTrackEngine
 
 
@@ -45,9 +43,9 @@ def _serialize_sample(sample: FilterSample) -> dict:
             "ideal_components": _serialize_components(sample.ideal_components or []),
             "discrete_components": _serialize_components(sample.discrete_components or []),
             "vact_tokens": sample.vact_tokens or [],
-            "vactdsl_tokens": sample.vactdsl_tokens or [],
-            "dslv2_tokens": sample.dslv2_tokens or [],
-            "dslv2_slot_values": sample.dslv2_slot_values or [],
+            "vact_struct_tokens": sample.vact_struct_tokens or [],
+            "dsl_tokens": sample.dsl_tokens or [],
+            "dsl_slot_values": sample.dsl_slot_values or [],
             "sfci_tokens": sample.sfci_tokens or [],
             "action_tokens": sample.action_tokens or [],
         }
@@ -61,10 +59,12 @@ def build_dataset(
     split: str = "train",
     use_ngspice: bool = False,
     seed: int = 42,
+    scenario: str | None = None,
+    scenario_weights: dict | None = None,
     emit_vact_cells: bool = True,
-    emit_vactdsl: bool = True,
+    emit_vact_struct: bool = True,
     emit_actions: bool = True,
-    emit_dslv2: bool = True,
+    emit_dsl: bool = True,
     max_nodes: int = 32,
     q_L: float | None = 50.0,
     q_C: float | None = 50.0,
@@ -101,106 +101,20 @@ def build_dataset(
             )
         return out
 
-    def _build_spec_masks(spec: dict, freq_hz: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float]:
-        f = np.asarray(freq_hz, dtype=float)
-        mask_min = np.full_like(f, np.nan, dtype=float)
-        mask_max = np.full_like(f, np.nan, dtype=float)
-        fc = float(spec.get("fc_hz", 0.0))
-        ripple_db = float(spec.get("ripple_db", 0.5))
-        passband_min_db = -abs(ripple_db)
-        stopband_max_db = float(spec.get("stopband_max_db", -40.0))
-        ftype = spec.get("filter_type", "lowpass")
-        if ftype == "lowpass":
-            pass_mask = f <= fc
-            stop_mask = f >= 2.0 * fc
-        elif ftype == "highpass":
-            pass_mask = f >= fc
-            stop_mask = f <= 0.5 * fc
-        elif ftype == "bandpass":
-            bw = float(spec.get("bw_frac") or 0.2)
-            pass_lo = fc * (1.0 - 0.5 * bw)
-            pass_hi = fc * (1.0 + 0.5 * bw)
-            stop_lo = fc * (1.0 - 1.5 * bw)
-            stop_hi = fc * (1.0 + 1.5 * bw)
-            pass_mask = (f >= pass_lo) & (f <= pass_hi)
-            stop_mask = (f <= stop_lo) | (f >= stop_hi)
-        elif ftype == "bandstop":
-            bw = float(spec.get("bw_frac") or 0.2)
-            stop_lo = fc * (1.0 - 0.5 * bw)
-            stop_hi = fc * (1.0 + 0.5 * bw)
-            pass_lo = fc * (1.0 - 1.5 * bw)
-            pass_hi = fc * (1.0 + 1.5 * bw)
-            pass_mask = (f <= pass_lo) | (f >= pass_hi)
-            stop_mask = (f >= stop_lo) & (f <= stop_hi)
-        else:
-            pass_mask = f <= fc
-            stop_mask = f >= 2.0 * fc
-        mask_min[pass_mask] = passband_min_db
-        mask_max[stop_mask] = stopband_max_db
-        return mask_min, mask_max, passband_min_db, stopband_max_db
-
     with open(jsonl_path, "w") as f:
         for i in range(num_samples):
-            spec = sample_filter_spec(rng=rng)
+            spec = sample_scenario_spec(rng=rng, scenario=scenario, scenario_weights=scenario_weights)
             z0 = spec["z0"]
             if fast_engine is None or float(z0) != float(fast_engine.z0):
                 fast_engine = FastTrackEngine(z0=float(z0), device="cpu", dtype=torch.float64)
             base_components = synthesize_filter(spec)
+            base_components = apply_scenario_postprocess(base_components, spec, rng=rng)
 
-            # 频率轴：依据 filter_type 选取覆盖区间
-            fc = spec["fc_hz"]
-            f_min = fc / 10.0
-            f_max = fc * 10.0
-            if spec.get("filter_type") == "bandpass":
-                fbw = float(spec.get("bw_frac") or 0.2)
-                f_min = fc * (1 - fbw) * 0.8
-                f_max = fc * (1 + fbw) * 1.2
-            freq_hz = np.logspace(np.log10(f_min), np.log10(f_max), 256)
-            mask_min_db, mask_max_db, passband_min_db, stopband_max_db = _build_spec_masks(spec, freq_hz)
+            freq_hz = build_freq_grid(spec, num_freqs=256)
+            mask_min_db, mask_max_db, passband_min_db, stopband_max_db = build_spec_masks(spec, freq_hz)
 
-            # dual-band：并联第二个 bandpass 子滤波器
-            if spec.get("scenario") == "dualband" and spec.get("fc2_hz"):
-                spec2 = dict(spec)
-                spec2["fc_hz"] = spec["fc2_hz"]
-                spec2["filter_type"] = "bandpass"
-                spec2["bw_frac"] = spec.get("bw_frac")
-                comps2 = synthesize_filter(spec2)
-                # 重命名内部节点避免冲突，保留 in/out/gnd
-                renamed = []
-                for c in comps2:
-                    def _ren(node: str) -> str:
-                        if node in ("in", "out", "gnd"):
-                            return node
-                        return f"{node}_b2"
-                    renamed.append(
-                        ComponentSpec(
-                            ctype=c.ctype,
-                            role=c.role,
-                            value_si=c.value_si,
-                            std_label=c.std_label,
-                            node1=_ren(c.node1),
-                            node2=_ren(c.node2),
-                        )
-                    )
-                base_components = base_components + renamed
-
-            # 可选 notch：在某个主节点挂一个串联 LC 到地
-            if spec.get("scenario") == "notch":
-                # 选一个非 gnd 的节点作挂载
-                nodes = []
-                for c in base_components:
-                    nodes.extend([c.node1, c.node2])
-                nodes = [n for n in set(nodes) if n not in ("gnd", "out")]
-                anchor = nodes[0] if nodes else "in"
-                f_notch = fc * rng.uniform(1.2, 1.8)
-                Cn = 1e-12 * rng.uniform(0.5, 5.0)
-                Ln = 1.0 / ((2 * np.pi * f_notch) ** 2 * Cn)
-                mid_node = f"{anchor}_notch"
-                base_components.append(ComponentSpec("L", "series", Ln, None, anchor, mid_node))
-                base_components.append(ComponentSpec("C", "series", Cn, None, mid_node, "gnd"))
-
-            # 非纯 ladder（notch/dualband/BP）优先用仿真获取 ideal，以避免 ABCD 近似误差
-            need_sim_for_ideal = spec.get("scenario") in ("notch", "dualband") or spec.get("filter_type") != "lowpass"
+            # 非纯 ladder（notch/BP/BS）优先用仿真获取 ideal，以避免 ABCD 近似误差
+            need_sim_for_ideal = spec.get("scenario") in ("anti_jamming",) or spec.get("filter_type") != "lowpass"
 
             # Canonicalize node names so tokenization stays in-vocab.
             base_components = canonicalize_nodes(base_components, max_nodes=max_nodes)
@@ -275,18 +189,28 @@ def build_dataset(
                 emit_cell_tokens=emit_vact_cells,
                 normalize_node_order=True,
             )
-            vactdsl_tokens = None
-            if emit_vactdsl:
-                vactdsl_tokens = [f"<ORDER_{spec['order']}>", "<SEP>"] + components_to_vactdsl_tokens(
+            vact_struct_tokens = None
+            if emit_vact_struct:
+                vact_struct_tokens = [f"<ORDER_{spec['order']}>", "<SEP>"] + components_to_vact_struct_tokens(
                     discrete_components,
                     z0=float(z0),
                     include_ports=True,
                     emit_cells=True,
                 )
-            dslv2_tokens = None
-            dslv2_slot_values = None
-            if emit_dslv2:
-                dslv2_tokens, dslv2_slot_values = components_to_dslv2_tokens(discrete_components)
+            dsl_tokens = None
+            dsl_slot_values = None
+            if emit_dsl:
+                ftype = str(spec.get("filter_type") or "lowpass")
+                if ftype == "bandstop":
+                    macro_name = MACRO_CELL_BS_PAR_SER_LC
+                elif ftype == "highpass":
+                    macro_name = MACRO_CELL_CS_LS
+                else:
+                    macro_name = None
+                if macro_name:
+                    dsl_tokens, dsl_slot_values = components_to_dsl_tokens(discrete_components, macro_name=macro_name)
+                else:
+                    dsl_tokens, dsl_slot_values = components_to_dsl_tokens(discrete_components)
             sfci_tokens = components_to_sfci_net_tokens(discrete_components)
             action_tokens = components_to_action_tokens(discrete_components) if emit_actions else None
             sample = FilterSample(
@@ -303,6 +227,13 @@ def build_dataset(
                 num_L=sum(1 for c in base_components if c.ctype == "L"),
                 num_C=sum(1 for c in base_components if c.ctype == "C"),
                 scenario=spec.get("scenario"),
+                scenario_id=spec.get("scenario_id"),
+                bw_frac=spec.get("bw_frac"),
+                return_loss_min_db=spec.get("return_loss_min_db"),
+                notch_freq_hz=spec.get("notch_freq_hz"),
+                notch_depth_db=spec.get("notch_depth_db"),
+                notch_bw_frac=spec.get("notch_bw_frac"),
+                asymmetry_factor=spec.get("asymmetry_factor"),
                 ideal_components=base_components,
                 discrete_components=discrete_components,
                 json_components=None,
@@ -316,9 +247,9 @@ def build_dataset(
                 mask_min_db=mask_min_db,
                 mask_max_db=mask_max_db,
                 vact_tokens=vact_tokens,
-                vactdsl_tokens=vactdsl_tokens,
-                dslv2_tokens=dslv2_tokens,
-                dslv2_slot_values=dslv2_slot_values,
+                vact_struct_tokens=vact_struct_tokens,
+                dsl_tokens=dsl_tokens,
+                dsl_slot_values=dsl_slot_values,
                 sfci_tokens=sfci_tokens,
                 action_tokens=action_tokens,
             )

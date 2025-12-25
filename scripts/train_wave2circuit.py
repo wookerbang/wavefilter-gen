@@ -19,7 +19,7 @@ if str(ROOT) not in sys.path:
 from src.data.torch_dataset import FilterDesignDataset
 from src.data import quantization
 from src.data.vact_codec import CELL_TOKEN, ORDER_PREFIX, SEP_TOKEN
-from src.data.dsl_codec import (
+from src.data.vact_struct import (
     CIRCUIT_END,
     CIRCUIT_START,
     CELL_END,
@@ -31,7 +31,7 @@ from src.data.dsl_codec import (
     SHUNT_BLOCK_START,
     Z0_50,
 )
-from src.data.dsl_v2 import VALUE_SLOTS, make_dslv2_prefix_allowed_tokens_fn
+from src.data.dsl import VALUE_SLOTS, make_dsl_prefix_allowed_tokens_fn
 from src.models import VACTT5
 
 
@@ -55,8 +55,10 @@ def make_collate_fn(tokenizer, use_repr: str):
 
         if use_repr == "vact":
             tokens_key = "vact_tokens"
-        elif use_repr == "vactdsl":
-            tokens_key = "vactdsl_tokens"
+        elif use_repr == "vact_struct":
+            tokens_key = "vact_struct_tokens"
+        elif use_repr == "dsl":
+            tokens_key = "dsl_tokens"
         else:
             tokens_key = "sfci_tokens"
         seqs = []
@@ -205,7 +207,7 @@ def build_train_time_grammar_masker(tokenizer, *, repr_kind: str):
                 masked[b, t, dis] = -1e9
         return masked
 
-    def _mask_vactdsl(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    def _mask_vact_struct(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         dec_in = _shift_right(labels, pad_id)
         masked = logits.clone()
         B, L, V = masked.shape
@@ -434,12 +436,12 @@ def build_train_time_grammar_masker(tokenizer, *, repr_kind: str):
 
     if repr_kind == "vact":
         return _mask_vact
-    if repr_kind == "vactdsl":
-        return _mask_vactdsl
-    if repr_kind == "dslv2":
-        prefix_allowed = make_dslv2_prefix_allowed_tokens_fn(tokenizer)
+    if repr_kind == "vact_struct":
+        return _mask_vact_struct
+    if repr_kind == "dsl":
+        prefix_allowed = make_dsl_prefix_allowed_tokens_fn(tokenizer)
 
-        def _mask_dslv2(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        def _mask_dsl(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
             dec_in = _shift_right(labels, pad_id)
             masked = logits.clone()
             B, L, V = masked.shape
@@ -456,7 +458,7 @@ def build_train_time_grammar_masker(tokenizer, *, repr_kind: str):
                     masked[b, t, dis] = -1e9
             return masked
 
-        return _mask_dslv2
+        return _mask_dsl
     return None
 
 
@@ -520,7 +522,12 @@ def parse_args() -> argparse.Namespace:
         default=0.3,
         help="When --use-wave mix, probability of picking real waveform (rest ideal).",
     )
-    p.add_argument("--repr", choices=["vact", "vactdsl", "dslv2", "sfci", "action"], default="vact", help="Which token sequence to train on.")
+    p.add_argument(
+        "--repr",
+        choices=["vact", "vact_struct", "dsl", "sfci", "action", "vactdsl", "dslv2"],
+        default="vact",
+        help="Which token sequence to train on.",
+    )
     p.add_argument("--grammar-mask", action="store_true", help="Apply FSM grammar mask during training (train/infer aligned).")
     p.add_argument("--wave-norm", action="store_true", help="Per-channel standardize waveforms for stability.")
     p.add_argument("--num-workers", type=int, default=4, help="Dataloader workers.")
@@ -550,6 +557,8 @@ def build_value_token_info(tokenizer) -> tuple[list[int], dict[int, int]]:
 
 def main() -> None:
     args = parse_args()
+    repr_alias = {"vactdsl": "vact_struct", "dslv2": "dsl"}
+    args.repr = repr_alias.get(args.repr, args.repr)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

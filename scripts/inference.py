@@ -18,8 +18,8 @@ if str(ROOT) not in sys.path:
 
 from src.data.torch_dataset import FilterDesignDataset
 from src.data.vact_codec import make_vact_syntax_prefix_allowed_tokens_fn
-from src.data.dsl_codec import make_vactdsl_prefix_allowed_tokens_fn
-from src.data.dsl_v2 import VALUE_SLOTS, make_dslv2_prefix_allowed_tokens_fn
+from src.data.vact_struct import make_vact_struct_prefix_allowed_tokens_fn
+from src.data.dsl import VALUE_SLOTS, make_dsl_prefix_allowed_tokens_fn
 from src.data.token_decode import build_label_value_map, decode_components_from_token_ids
 from src.models import VACTT5
 from src.physics import FastTrackEngine
@@ -40,7 +40,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ckpt", required=True, type=Path, help="Checkpoint dir (trainer save).")
     p.add_argument("--tokenizer", type=Path, help="Tokenizer path (defaults to --ckpt).")
     p.add_argument("--t5-name", type=str, default="t5-small", help="Base T5 model name (for raw state_dict load).")
-    p.add_argument("--repr", choices=["vact", "vactdsl", "dslv2", "action"], default="vactdsl")
+    p.add_argument(
+        "--repr",
+        choices=["vact", "vact_struct", "dsl", "action", "vactdsl", "dslv2"],
+        default="vact_struct",
+    )
     p.add_argument("--num", type=int, default=50, help="Number of samples to run.")
     p.add_argument("--seed", type=int, default=0, help="Random seed for sample selection.")
     p.add_argument("--use-wave", default="ideal", choices=["ideal", "real", "both", "ideal_s21", "real_s21", "mix"])
@@ -56,7 +60,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature (used when --do-sample).")
     p.add_argument("--max-new", type=int, default=256, help="Max new tokens.")
     p.add_argument("--syntax-mask", action="store_true", help="Apply representation grammar mask during decoding.")
-    p.add_argument("--value-mode", choices=["standard", "precision"], default="precision", help="Numeric inference mode for DSL v2 slots.")
+    p.add_argument("--value-mode", choices=["standard", "precision"], default="precision", help="Numeric inference mode for DSL slots.")
 
     # verifier / refinement
     p.add_argument("--verify-top", type=int, default=4, help="Refine top-M candidates after verifier scoring.")
@@ -115,6 +119,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    repr_alias = {"vactdsl": "vact_struct", "dslv2": "dsl"}
+    args.repr = repr_alias.get(args.repr, args.repr)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -167,10 +173,10 @@ def main() -> None:
     if args.syntax_mask:
         if args.repr == "vact":
             prefix_allowed = make_vact_syntax_prefix_allowed_tokens_fn(tokenizer)
-        elif args.repr == "vactdsl":
-            prefix_allowed = make_vactdsl_prefix_allowed_tokens_fn(tokenizer)
-        elif args.repr == "dslv2":
-            prefix_allowed = make_dslv2_prefix_allowed_tokens_fn(tokenizer)
+        elif args.repr == "vact_struct":
+            prefix_allowed = make_vact_struct_prefix_allowed_tokens_fn(tokenizer)
+        elif args.repr == "dsl":
+            prefix_allowed = make_dsl_prefix_allowed_tokens_fn(tokenizer)
 
     q_l = args.q if args.q_l is None else args.q_l
     q_c = args.q if args.q_c is None else args.q_c
@@ -245,7 +251,7 @@ def main() -> None:
         seqs = outs.cpu().tolist()
 
         slot_values_seqs = None
-        if args.repr == "dslv2":
+        if args.repr == "dsl":
             seq_lens = [len(s) for s in seqs]
             max_len = max(seq_lens) if seq_lens else 0
             if max_len > 0:

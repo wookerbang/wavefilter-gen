@@ -45,8 +45,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--ensure-scenarios",
         type=str,
-        default="base,notch,dualband",
-        help="Comma-separated scenarios to include if available (default: base,notch,dualband).",
+        default="general,anti_jamming,coexistence,wideband_rejection,random_basic",
+        help="Comma-separated scenarios to include if available.",
     )
     p.add_argument(
         "--min-per-scenario",
@@ -113,7 +113,7 @@ def _load_samples(path: Path, *, components_key: str) -> List[SampleRecord]:
             comp_list = [_component_from_dict(c) for c in comps if c]
             if not comp_list:
                 continue
-            scenario = row.get("scenario") or "base"
+            scenario = row.get("scenario") or "general"
             sample_id = str(row.get("sample_id") or row.get("circuit_id") or row.get("spec_id") or "unknown")
             records.append(
                 SampleRecord(

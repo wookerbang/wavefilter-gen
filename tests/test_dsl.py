@@ -2,7 +2,7 @@ import math
 import random
 import unittest
 
-from src.data.dsl_v2 import (
+from src.data.dsl import (
     BOS,
     CASCADE,
     CALL,
@@ -18,6 +18,7 @@ from src.data.dsl_v2 import (
     MACRO_CELL_CS_LS,
     MACRO_CELL_LS,
     MACRO_CELL_LS_CS,
+    MACRO_CELL_BS_PAR_SER_LC,
     MACRO_PI_CLC,
     MACRO_LIBRARY,
     MAIN_END,
@@ -30,10 +31,10 @@ from src.data.dsl_v2 import (
     SLOT_TYPE_TO_TOKEN,
     VAL_C,
     VAL_L,
-    components_to_dslv2_tokens,
-    dslv2_tokens_to_components,
-    dslv2_tokens_to_action_tokens,
-    make_dslv2_prefix_allowed_tokens_fn,
+    components_to_dsl_tokens,
+    dsl_tokens_to_components,
+    dsl_tokens_to_action_tokens,
+    make_dsl_prefix_allowed_tokens_fn,
     MacroDef,
 )
 from src.data.schema import ComponentSpec
@@ -50,7 +51,7 @@ class DummyTokenizer:
         return self._vocab
 
 
-class DSLv2Tests(unittest.TestCase):
+class DSLTests(unittest.TestCase):
     def test_unknown_slot_type_raises(self):
         macro_name = "<MAC_BOGUS_X>"
         bogus_macro = MacroDef(macro_name, ("X",), lambda a, b, g, vals, idx=0: [])
@@ -59,13 +60,13 @@ class DSLv2Tests(unittest.TestCase):
         MACRO_LIBRARY[macro_name] = bogus_macro
         try:
             with self.assertRaises(ValueError):
-                components_to_dslv2_tokens(components, macro_name=macro_name)
+                components_to_dsl_tokens(components, macro_name=macro_name)
         finally:
             MACRO_LIBRARY.pop(macro_name, None)
 
     def test_repeat_round_trip_with_and_without_cell_markers(self):
         rng = random.Random(0)
-        macros = [MACRO_CELL_LS_CS, MACRO_CELL_CS_LS, MACRO_CELL_LS, MACRO_CELL_CS]
+        macros = [MACRO_CELL_LS_CS, MACRO_CELL_CS_LS, MACRO_CELL_LS, MACRO_CELL_CS, MACRO_CELL_BS_PAR_SER_LC]
         num_trials = 1000
         for with_cells in (True, False):
             for _ in range(num_trials):
@@ -89,7 +90,7 @@ class DSLv2Tests(unittest.TestCase):
                             vals.append(rng.uniform(1e-6, 1e-3))
                     comps.extend(macro.expand_fn(a, b, "gnd", vals, i))
 
-                tokens, slot_values = components_to_dslv2_tokens(comps, macro_name=macro_name)
+                tokens, slot_values = components_to_dsl_tokens(comps, macro_name=macro_name)
                 if not with_cells:
                     new_tokens = []
                     new_slots = []
@@ -100,7 +101,7 @@ class DSLv2Tests(unittest.TestCase):
                         new_slots.append(v)
                     tokens, slot_values = new_tokens, new_slots
 
-                decoded = dslv2_tokens_to_components(tokens, slot_values=slot_values)
+                decoded = dsl_tokens_to_components(tokens, slot_values=slot_values)
                 self.assertEqual(len(decoded), len(comps))
                 for c1, c2 in zip(comps, decoded):
                     self.assertEqual(c1.ctype, c2.ctype)
@@ -135,7 +136,7 @@ class DSLv2Tests(unittest.TestCase):
             }
         )
         tok = DummyTokenizer(vocab_tokens)
-        prefix_fn = make_dslv2_prefix_allowed_tokens_fn(tok)
+        prefix_fn = make_dsl_prefix_allowed_tokens_fn(tok)
 
         prefix_after_ports = [tok.get_vocab()[t] for t in (MAIN_START, PORT_IN, PORT_OUT, PORT_GND)]
         allowed = prefix_fn(0, prefix_after_ports)
@@ -148,7 +149,7 @@ class DSLv2Tests(unittest.TestCase):
     def test_varint_k_and_cell_indices_round_trip(self):
         macro = MACRO_CELL_LS_CS
         vals = [[1e-9, 2e-12] for _ in range(15)]
-        tokens, slots = components_to_dslv2_tokens(
+        tokens, slots = components_to_dsl_tokens(
             [],
             macro_name=macro,
             segments=[(macro, vals)],
@@ -162,7 +163,7 @@ class DSLv2Tests(unittest.TestCase):
         self.assertTrue(any(t in DIGIT_TOKENS for t in tokens))
         # Ensure cell index tokens appear
         self.assertTrue(any(t in CELL_INDEX_TOKENS for t in tokens))
-        comps = dslv2_tokens_to_components(tokens, slot_values=slots)
+        comps = dsl_tokens_to_components(tokens, slot_values=slots)
         self.assertEqual(len(comps), 15 * 2)
         self.assertTrue(all(c.value_si > 0 for c in comps))
 
@@ -171,11 +172,11 @@ class DSLv2Tests(unittest.TestCase):
             (MACRO_CELL_LS, [[5e-9], [6e-9]]),  # repeat
             (MACRO_PI_CLC, [[1e-12, 2e-9, 1.5e-12]]),  # single CALL
         ]
-        tokens, slots = components_to_dslv2_tokens([], segments=segments, use_varint_k=True)
-        comps = dslv2_tokens_to_components(tokens, slot_values=slots)
+        tokens, slots = components_to_dsl_tokens([], segments=segments, use_varint_k=True)
+        comps = dsl_tokens_to_components(tokens, slot_values=slots)
         # Expect 2 series L + pi section (C, L, C)
         self.assertEqual(len(comps), 5)
-        action_tokens = dslv2_tokens_to_action_tokens(tokens, slot_values=slots)
+        action_tokens = dsl_tokens_to_action_tokens(tokens, slot_values=slots)
         self.assertIn("<ACT_START>", action_tokens[0])
 
 

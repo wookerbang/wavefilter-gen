@@ -90,6 +90,13 @@ class FilterSample:
     num_L: int
     num_C: int
     scenario: Optional[str] = None
+    scenario_id: Optional[int] = None
+    bw_frac: Optional[float] = None
+    return_loss_min_db: Optional[float] = None
+    notch_freq_hz: Optional[float] = None
+    notch_depth_db: Optional[float] = None
+    notch_bw_frac: Optional[float] = None
+    asymmetry_factor: Optional[float] = None
 
     # 可选信息
     ideal_components: Optional[List[ComponentSpec]] = None
@@ -107,9 +114,9 @@ class FilterSample:
     mask_max_db: Any = None
     # 输出
     vact_tokens: Optional[List[str]] = None  # component-centric VACT-Seq tokens
-    vactdsl_tokens: Optional[List[str]] = None  # structured VACT-DSL tokens
-    dslv2_tokens: Optional[List[str]] = None  # structured Macro/Repeat DSL v2 tokens
-    dslv2_slot_values: Optional[List[float]] = None  # numeric slots aligned with dslv2_tokens
+    vact_struct_tokens: Optional[List[str]] = None  # structured VACT-Struct tokens
+    dsl_tokens: Optional[List[str]] = None  # structured Macro/Repeat DSL tokens
+    dsl_slot_values: Optional[List[float]] = None  # numeric slots aligned with dsl_tokens
     sfci_tokens: Optional[List[str]] = None  # net-centric SFCI tokens
     action_tokens: Optional[List[str]] = None  # action-oriented construction tokens
     spec_id: Optional[int] = None
@@ -134,13 +141,20 @@ class FilterSample:
             "num_L": self.num_L,
             "num_C": self.num_C,
             "scenario": self.scenario,
+            "scenario_id": self.scenario_id,
+            "bw_frac": self.bw_frac,
+            "return_loss_min_db": self.return_loss_min_db,
+            "notch_freq_hz": self.notch_freq_hz,
+            "notch_depth_db": self.notch_depth_db,
+            "notch_bw_frac": self.notch_bw_frac,
+            "asymmetry_factor": self.asymmetry_factor,
             "passband_min_db": self.passband_min_db,
             "stopband_max_db": self.stopband_max_db,
             "json_components": self.json_components,
             "vact_tokens": self.vact_tokens or [],
-            "vactdsl_tokens": self.vactdsl_tokens or [],
-            "dslv2_tokens": self.dslv2_tokens or [],
-            "dslv2_slot_values": self.dslv2_slot_values or [],
+            "vact_struct_tokens": self.vact_struct_tokens or [],
+            "dsl_tokens": self.dsl_tokens or [],
+            "dsl_slot_values": self.dsl_slot_values or [],
             "sfci_tokens": self.sfci_tokens or [],
             "action_tokens": self.action_tokens or [],
         }

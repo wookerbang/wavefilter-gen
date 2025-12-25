@@ -7,6 +7,7 @@ from typing import Dict, Literal, Sequence, Tuple
 import numpy as np
 
 from src.data.schema import ComponentSpec
+from src.data.scenarios import build_spec_masks as _build_spec_masks
 from src.physics import FastTrackEngine
 
 YieldCIMethod = Literal["wilson", "agresti_coull"]
@@ -36,42 +37,7 @@ class YieldEstimate:
 
 
 def build_spec_masks(spec: dict, freq_hz: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float]:
-    f = np.asarray(freq_hz, dtype=float)
-    mask_min = np.full_like(f, np.nan, dtype=float)
-    mask_max = np.full_like(f, np.nan, dtype=float)
-    fc = float(spec.get("fc_hz", 0.0))
-    ripple_db = float(spec.get("ripple_db", 0.5))
-    passband_min_db = -abs(ripple_db)
-    stopband_max_db = float(spec.get("stopband_max_db", -40.0))
-    ftype = spec.get("filter_type", "lowpass")
-    if ftype == "lowpass":
-        pass_mask = f <= fc
-        stop_mask = f >= 2.0 * fc
-    elif ftype == "highpass":
-        pass_mask = f >= fc
-        stop_mask = f <= 0.5 * fc
-    elif ftype == "bandpass":
-        bw = float(spec.get("bw_frac") or 0.2)
-        pass_lo = fc * (1.0 - 0.5 * bw)
-        pass_hi = fc * (1.0 + 0.5 * bw)
-        stop_lo = fc * (1.0 - 1.5 * bw)
-        stop_hi = fc * (1.0 + 1.5 * bw)
-        pass_mask = (f >= pass_lo) & (f <= pass_hi)
-        stop_mask = (f <= stop_lo) | (f >= stop_hi)
-    elif ftype == "bandstop":
-        bw = float(spec.get("bw_frac") or 0.2)
-        stop_lo = fc * (1.0 - 0.5 * bw)
-        stop_hi = fc * (1.0 + 0.5 * bw)
-        pass_lo = fc * (1.0 - 1.5 * bw)
-        pass_hi = fc * (1.0 + 1.5 * bw)
-        pass_mask = (f <= pass_lo) | (f >= pass_hi)
-        stop_mask = (f >= stop_lo) & (f <= stop_hi)
-    else:
-        pass_mask = f <= fc
-        stop_mask = f >= 2.0 * fc
-    mask_min[pass_mask] = passband_min_db
-    mask_max[stop_mask] = stopband_max_db
-    return mask_min, mask_max, passband_min_db, stopband_max_db
+    return _build_spec_masks(spec, freq_hz)
 
 
 def prepare_yield_spec(

@@ -29,7 +29,7 @@ class SpecEncoder(nn.Module):
     def forward(self, filter_type_ids: torch.Tensor, log10_fc: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            filter_type_ids: (B,) long tensor (0=lowpass,1=bandpass)
+            filter_type_ids: (B,) long tensor (0=lowpass,1=highpass,2=bandpass,3=bandstop)
             log10_fc: (B,) float tensor of log10 cutoff freq
         Returns:
             (B, d_model) spec token

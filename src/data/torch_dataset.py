@@ -18,7 +18,7 @@ class FilterDesignDataset(Dataset):
         tokenizer,
         use_wave: Literal["ideal", "real", "both", "ideal_s21", "real_s21", "mix"] = "real",
         mix_real_prob: float = 0.3,
-        use_repr: Literal["vact", "vactdsl", "sfci", "action"] = "vact",
+        use_repr: Literal["vact", "vact_struct", "dsl", "sfci", "action"] = "vact",
         normalize_wave: bool = False,
     ):
         self.samples = []
@@ -28,7 +28,8 @@ class FilterDesignDataset(Dataset):
         self.tokenizer = tokenizer
         self.use_wave = use_wave
         self.mix_real_prob = mix_real_prob
-        self.use_repr = use_repr
+        repr_alias = {"vactdsl": "vact_struct", "dslv2": "dsl"}
+        self.use_repr = repr_alias.get(use_repr, use_repr)
         self.normalize_wave = normalize_wave
 
     def _tokens_to_ids(self, tokens: Sequence[str]) -> list[int]:
@@ -93,11 +94,11 @@ class FilterDesignDataset(Dataset):
         value_targets = None
         if self.use_repr == "vact":
             tokens_raw = s.get("vact_tokens")
-        elif self.use_repr == "vactdsl":
-            tokens_raw = s.get("vactdsl_tokens")
-        elif self.use_repr == "dslv2":
-            tokens_raw = s.get("dslv2_tokens")
-            value_targets = s.get("dslv2_slot_values")
+        elif self.use_repr == "vact_struct":
+            tokens_raw = s.get("vact_struct_tokens") or s.get("vactdsl_tokens")
+        elif self.use_repr == "dsl":
+            tokens_raw = s.get("dsl_tokens") or s.get("dslv2_tokens")
+            value_targets = s.get("dsl_slot_values") or s.get("dslv2_slot_values")
         elif self.use_repr == "sfci":
             tokens_raw = s.get("sfci_tokens")
         else:
@@ -118,8 +119,8 @@ class FilterDesignDataset(Dataset):
             # keep both keys so collate_fn can pick by repr
             "input_ids": token_ids,
             "vact_tokens": token_ids if self.use_repr == "vact" else None,
-            "vactdsl_tokens": token_ids if self.use_repr == "vactdsl" else None,
-            "dslv2_tokens": token_ids if self.use_repr == "dslv2" else None,
+            "vact_struct_tokens": token_ids if self.use_repr == "vact_struct" else None,
+            "dsl_tokens": token_ids if self.use_repr == "dsl" else None,
             "sfci_tokens": token_ids if self.use_repr == "sfci" else None,
             "action_tokens": token_ids if self.use_repr == "action" else None,
             "value_targets": value_targets,

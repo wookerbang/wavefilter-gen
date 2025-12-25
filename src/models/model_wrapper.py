@@ -64,7 +64,7 @@ class VACTT5(nn.Module):
         """
         Args:
             wave: (B, C, L) waveform (S21 or S21+S11)
-            filter_type: (B,) long tensor 0/1
+            filter_type: (B,) long tensor 0..3 (LP/HP/BP/BS)
             fc_hz: (B,) float tensor of cutoff freq in Hz
         """
         log_fc = torch.log10(fc_hz.clamp_min(1e-6))
