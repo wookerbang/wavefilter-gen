@@ -5,6 +5,7 @@ PyTorch Dataset 包装 processed jsonl。
 from __future__ import annotations
 
 import json
+import math
 from typing import Literal, Sequence
 
 import torch
@@ -20,6 +21,9 @@ class FilterDesignDataset(Dataset):
         mix_real_prob: float = 0.3,
         use_repr: Literal["vact", "vact_struct", "dsl", "sfci", "action"] = "vact",
         normalize_wave: bool = False,
+        freq_mode: Literal["none", "log_fc", "linear_fc", "log_f", "log_f_centered"] = "log_fc",
+        freq_scale: Literal["none", "log_fc", "log_f_mean"] = "none",
+        include_s11: bool = True,
     ):
         self.samples = []
         with open(jsonl_path, "r") as f:
@@ -28,9 +32,11 @@ class FilterDesignDataset(Dataset):
         self.tokenizer = tokenizer
         self.use_wave = use_wave
         self.mix_real_prob = mix_real_prob
-        repr_alias = {"vactdsl": "vact_struct", "dslv2": "dsl"}
-        self.use_repr = repr_alias.get(use_repr, use_repr)
+        self.use_repr = use_repr
         self.normalize_wave = normalize_wave
+        self.freq_mode = freq_mode
+        self.freq_scale = freq_scale
+        self.include_s11 = include_s11
 
     def _tokens_to_ids(self, tokens: Sequence[str]) -> list[int]:
         """
@@ -71,6 +77,16 @@ class FilterDesignDataset(Dataset):
         real_s21 = torch.tensor(s["real_s21_db"], dtype=torch.float32)
         real_s11 = torch.tensor(s["real_s11_db"], dtype=torch.float32)
 
+        fc_hz = float(s.get("fc_hz", 0.0) or 0.0)
+        if not math.isfinite(fc_hz) or fc_hz <= 0.0:
+            valid = torch.isfinite(freq)
+            if valid.any():
+                fmin = float(freq[valid].min().item())
+                fmax = float(freq[valid].max().item())
+                fc_hz = math.sqrt(max(fmin * fmax, 1e-12))
+            else:
+                fc_hz = 1.0
+
         mode = self.use_wave
         if mode == "mix":
             mode = "real" if torch.rand(1).item() < self.mix_real_prob else "ideal"
@@ -86,19 +102,62 @@ class FilterDesignDataset(Dataset):
         else:
             wave = torch.stack([ideal_s21, ideal_s11, real_s21, real_s11], dim=0)
 
+        if not self.include_s11:
+            if wave.shape[0] == 4:
+                wave = wave[[0, 2], :]
+            elif wave.shape[0] > 1:
+                wave = wave[:1]
+
+        freq_channels = 0
+        if self.freq_mode != "none" or self.freq_scale != "none":
+            eps = 1e-12
+            freq_clamped = freq.clamp_min(eps)
+            freq_feats = []
+            logf = None
+            mean_logf = None
+            if self.freq_mode == "log_fc":
+                freq_feats.append(torch.log10(freq_clamped / fc_hz))
+            elif self.freq_mode == "linear_fc":
+                freq_feats.append(freq / fc_hz)
+            elif self.freq_mode == "log_f":
+                logf = torch.log10(freq_clamped)
+                freq_feats.append(logf)
+            elif self.freq_mode == "log_f_centered":
+                logf = torch.log10(freq_clamped)
+                mean_logf = float(logf.mean().item())
+                freq_feats.append(logf - mean_logf)
+            elif self.freq_mode != "none":
+                raise ValueError(f"Unknown freq_mode: {self.freq_mode}")
+
+            if self.freq_scale == "log_fc":
+                freq_feats.append(torch.full_like(freq, math.log10(fc_hz)))
+            elif self.freq_scale == "log_f_mean":
+                if logf is None:
+                    logf = torch.log10(freq_clamped)
+                if mean_logf is None:
+                    mean_logf = float(logf.mean().item())
+                freq_feats.append(torch.full_like(freq, mean_logf))
+            elif self.freq_scale != "none":
+                raise ValueError(f"Unknown freq_scale: {self.freq_scale}")
+
+            if freq_feats:
+                freq_wave = torch.stack(freq_feats, dim=0)
+                wave = torch.cat([freq_wave, wave], dim=0)
+                freq_channels = freq_wave.shape[0]
+
         ftype = s.get("filter_type", "lowpass")
         type_map = {"lowpass": 0, "highpass": 1, "bandpass": 2, "bandstop": 3}
         type_id = type_map.get(ftype, 0)
-        scalar = torch.tensor([type_id, s["fc_hz"]], dtype=torch.float32)
+        scalar = torch.tensor([type_id, fc_hz], dtype=torch.float32)
 
         value_targets = None
         if self.use_repr == "vact":
             tokens_raw = s.get("vact_tokens")
         elif self.use_repr == "vact_struct":
-            tokens_raw = s.get("vact_struct_tokens") or s.get("vactdsl_tokens")
+            tokens_raw = s.get("vact_struct_tokens")
         elif self.use_repr == "dsl":
-            tokens_raw = s.get("dsl_tokens") or s.get("dslv2_tokens")
-            value_targets = s.get("dsl_slot_values") or s.get("dslv2_slot_values")
+            tokens_raw = s.get("dsl_tokens")
+            value_targets = s.get("dsl_slot_values")
         elif self.use_repr == "sfci":
             tokens_raw = s.get("sfci_tokens")
         else:
@@ -108,9 +167,11 @@ class FilterDesignDataset(Dataset):
 
         if self.normalize_wave:
             # channel-wise standardization to stabilize optimization
-            wave = wave - wave.mean(dim=-1, keepdim=True)
-            wave_std = wave.std(dim=-1, keepdim=True).clamp_min(1e-4)
-            wave = wave / wave_std
+            if freq_channels < wave.shape[0]:
+                wave_sig = wave[freq_channels:]
+                wave_sig = wave_sig - wave_sig.mean(dim=-1, keepdim=True)
+                wave_std = wave_sig.std(dim=-1, keepdim=True).clamp_min(1e-4)
+                wave[freq_channels:] = wave_sig / wave_std
 
         return {
             "freq": freq,

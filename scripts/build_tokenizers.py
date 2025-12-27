@@ -27,7 +27,19 @@ from src.data.dsl import build_dsl_vocab  # noqa: E402
 SPECIAL_TOKENS = ["<pad>", "</s>", "<unk>"]
 
 
+def _dedup_preserve_order(tokens: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for tok in tokens:
+        if tok in seen:
+            continue
+        seen.add(tok)
+        out.append(tok)
+    return out
+
+
 def build_wordlevel_tokenizer(tokens: List[str], save_dir: Path) -> None:
+    tokens = _dedup_preserve_order(tokens)
     vocab = {tok: i for i, tok in enumerate(tokens)}
     tok = Tokenizer(WordLevel(vocab=vocab, unk_token="<unk>"))
     tok.pre_tokenizer = Whitespace()

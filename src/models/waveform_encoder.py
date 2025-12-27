@@ -9,7 +9,7 @@ import torch.nn as nn
 class MultiScaleWaveformEncoder(nn.Module):
     """
     多尺度并行编码器：小核支路捕捉纹波，大核支路捕捉趋势。
-    输入默认 (B, 1, 256)，输出约 (B, 64, d_model)。
+    输入 (B, C, L)，输出约 (B, 64, d_model)。
     """
 
     def __init__(self, d_model: int = 512, in_channels: int = 1, dropout: float = 0.1):

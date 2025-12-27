@@ -91,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--t5-name", type=str, default="t5-small", help="Base T5 model name (for raw state_dict load).")
     p.add_argument(
         "--repr",
-        choices=["vact", "vact_struct", "dsl", "action", "vactdsl", "dslv2"],
+        choices=["vact", "vact_struct", "dsl", "action"],
         default="vact_struct",
         help="Target representation to decode.",
     )
@@ -99,6 +99,48 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0, help="Random seed for sample selection.")
     p.add_argument("--use-wave", default="real", choices=["ideal", "real", "both", "ideal_s21", "real_s21", "mix"])
     p.add_argument("--wave-norm", action="store_true", help="Normalize waveforms (must match training if enabled).")
+    p.add_argument(
+        "--freq-mode",
+        choices=["none", "log_fc", "linear_fc", "log_f", "log_f_centered"],
+        default="log_fc",
+        help=(
+            "Prepend frequency-position channel: "
+            "none (no freq channel), "
+            "log_fc (log10(f/fc)), "
+            "linear_fc (f/fc), "
+            "log_f (log10(f)), "
+            "log_f_centered (log10(f) - mean(log10(f)))."
+        ),
+    )
+    p.add_argument(
+        "--freq-scale",
+        choices=["none", "log_fc", "log_f_mean"],
+        default="none",
+        help=(
+            "Optional constant scale channel: "
+            "none, "
+            "log_fc (repeat log10(fc)), "
+            "log_f_mean (repeat mean(log10(f)))."
+        ),
+    )
+    p.add_argument(
+        "--spec-mode",
+        choices=["none", "type_fc"],
+        default="none",
+        help="Spec token usage: none (wave-only) or type_fc (prepend filter type + fc token).",
+    )
+    p.add_argument(
+        "--no-s11",
+        dest="include_s11",
+        action="store_false",
+        help="Drop S11 channels from waveform input.",
+    )
+    p.set_defaults(include_s11=True)
+    p.add_argument(
+        "--allow-input-mismatch",
+        action="store_true",
+        help="Allow input config mismatch with checkpoint (may skip weights).",
+    )
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
     # generation
@@ -141,8 +183,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    repr_alias = {"vactdsl": "vact_struct", "dslv2": "dsl"}
-    args.repr = repr_alias.get(args.repr, args.repr)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -153,11 +193,44 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
 
     # dataset for waveform/spec conditioning + raw targets
-    ds = FilterDesignDataset(str(args.data), tokenizer, use_wave=args.use_wave, normalize_wave=args.wave_norm, use_repr="vact")
+    ds = FilterDesignDataset(
+        str(args.data),
+        tokenizer,
+        use_wave=args.use_wave,
+        normalize_wave=args.wave_norm,
+        use_repr="vact",
+        freq_mode=args.freq_mode,
+        freq_scale=args.freq_scale,
+        include_s11=args.include_s11,
+    )
     idxs = random.sample(range(len(ds)), min(int(args.num), len(ds)))
 
     # model
     in_channels = ds[0]["wave"].shape[0]
+    cfg_path = args.ckpt / "input_config.json"
+    if cfg_path.exists():
+        with cfg_path.open() as f:
+            cfg = json.load(f)
+        mismatches = []
+        for key, expected in (
+            ("freq_mode", args.freq_mode),
+            ("freq_scale", args.freq_scale),
+            ("include_s11", bool(args.include_s11)),
+            ("spec_mode", args.spec_mode),
+        ):
+            if key in cfg and cfg[key] != expected:
+                mismatches.append((key, cfg[key], expected))
+        if "in_channels" in cfg and int(cfg["in_channels"]) != int(in_channels):
+            mismatches.append(("in_channels", cfg["in_channels"], int(in_channels)))
+        if mismatches:
+            lines = ["Input config mismatch with checkpoint:"]
+            lines.extend([f"- {k}: ckpt={v_ckpt} current={v_cur}" for k, v_ckpt, v_cur in mismatches])
+            lines.append("Align flags or pass --allow-input-mismatch.")
+            msg = "\n".join(lines)
+            if args.allow_input_mismatch:
+                print(f"[warn] {msg}")
+            else:
+                raise ValueError(msg)
     def _build_value_token_info(tok):
         vocab = tok.get_vocab()
         val_ids = []
@@ -176,6 +249,7 @@ def main() -> None:
         t5_name=args.t5_name,
         waveform_in_channels=in_channels,
         vocab_size=len(tokenizer),
+        spec_mode=args.spec_mode,
         value_token_ids=value_token_ids,
         slot_type_token_to_idx=slot_type_map,
     )
@@ -288,7 +362,13 @@ def main() -> None:
                 filter_rep = filter_type.repeat(len(seqs))
                 fc_rep = fc_hz_tensor.repeat(len(seqs))
                 with torch.no_grad():
-                    pred_vals = model.predict_values(wave_rep, filter_rep, fc_rep, seq_tensor, mode=args.value_mode)
+                    pred_vals = model.predict_values(
+                        wave_rep,
+                        filter_rep,
+                        fc_rep,
+                        token_ids=seq_tensor,
+                        mode=args.value_mode,
+                    )
                 pred_vals = pred_vals.detach().cpu().tolist()
                 slot_values_seqs = [pred_vals[i][: seq_lens[i]] for i in range(len(seqs))]
 

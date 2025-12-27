@@ -121,10 +121,11 @@ def build_dataset(
 
             # Output label: nominal standard parts (no tolerance, no loss).
             discrete_components = quantize_components(base_components, series="E24")
+            ideal_components = base_components
             ref_freq_hz = float(spec.get("fc_hz") or np.sqrt(float(np.min(freq_hz)) * float(np.max(freq_hz))))
             if need_sim_for_ideal and use_ngspice:
                 ideal_s21_db, ideal_s11_db = simulate_real_waveform(
-                    discrete_components,
+                    ideal_components,
                     spec,
                     freq_hz,
                     use_ngspice=True,
@@ -135,7 +136,7 @@ def build_dataset(
                 )
             else:
                 ideal_s21_db, ideal_s11_db = fast_engine.simulate_sparams_db(
-                    discrete_components,
+                    ideal_components,
                     freq_hz,
                     q_L=None,
                     q_C=None,

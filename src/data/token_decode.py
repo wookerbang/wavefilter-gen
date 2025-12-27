@@ -35,8 +35,7 @@ def decode_components_from_token_ids(
     label_to_value: Mapping[str, float] | None = None,
     slot_values: Sequence[float] | None = None,
 ) -> Tuple[list, List[str]]:
-    repr_alias = {"vactdsl": "vact_struct", "dslv2": "dsl"}
-    repr_kind = repr_alias.get(str(repr_kind), str(repr_kind))
+    repr_kind = str(repr_kind)
     ids = list(token_ids)
     tokens = tokenizer.convert_ids_to_tokens(ids, skip_special_tokens=True)
     if repr_kind == "vact":

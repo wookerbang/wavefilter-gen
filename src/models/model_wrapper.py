@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Mapping, Optional, Sequence
+from typing import Literal, Mapping, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -27,6 +27,7 @@ class VACTT5(nn.Module):
         waveform_in_channels: int = 1,
         d_model_override: Optional[int] = None,
         vocab_size: Optional[int] = None,
+        spec_mode: Literal["type_fc", "none"] = "type_fc",
         value_loss_weight: float = 1.0,
         mdr_cfg: MDRConfig = MDRConfig(),
         value_token_ids: Optional[Sequence[int]] = None,
@@ -39,7 +40,12 @@ class VACTT5(nn.Module):
         d_model = d_model_override or self.t5.config.d_model
 
         self.wave_encoder = MultiScaleWaveformEncoder(d_model=d_model, in_channels=waveform_in_channels)
-        self.spec_encoder = SpecEncoder(d_model=d_model, type_vocab_size=4)
+        if spec_mode == "none":
+            self.spec_encoder = None
+        elif spec_mode == "type_fc":
+            self.spec_encoder = SpecEncoder(d_model=d_model, type_vocab_size=4)
+        else:
+            raise ValueError(f"Unknown spec_mode: {spec_mode}")
 
         self.mdr_cfg = mdr_cfg
         self.value_loss_weight = value_loss_weight
@@ -60,24 +66,33 @@ class VACTT5(nn.Module):
             num_slot_types=int(torch.max(slot_lookup).item() + 1) if slot_type_token_to_idx else 0,
         )
 
-    def encode(self, wave: torch.Tensor, filter_type: torch.Tensor, fc_hz: torch.Tensor) -> BaseModelOutput:
+    def encode(
+        self,
+        wave: torch.Tensor,
+        filter_type: Optional[torch.Tensor] = None,
+        fc_hz: Optional[torch.Tensor] = None,
+    ) -> BaseModelOutput:
         """
         Args:
-            wave: (B, C, L) waveform (S21 or S21+S11)
+            wave: (B, C, L) waveform (freq channels + S21(/S11))
             filter_type: (B,) long tensor 0..3 (LP/HP/BP/BS)
             fc_hz: (B,) float tensor of cutoff freq in Hz
         """
+        wave_feat = self.wave_encoder(wave)  # (B,Lw,d)
+        if self.spec_encoder is None:
+            return BaseModelOutput(last_hidden_state=wave_feat)
+        if filter_type is None or fc_hz is None:
+            raise ValueError("Spec encoder enabled but filter_type/fc_hz not provided.")
         log_fc = torch.log10(fc_hz.clamp_min(1e-6))
         spec_tok = self.spec_encoder(filter_type, log_fc).unsqueeze(1)  # (B,1,d)
-        wave_feat = self.wave_encoder(wave)  # (B,Lw,d)
         enc = torch.cat([spec_tok, wave_feat], dim=1)
         return BaseModelOutput(last_hidden_state=enc)
 
     def forward(
         self,
         wave: torch.Tensor,
-        filter_type: torch.Tensor,
-        fc_hz: torch.Tensor,
+        filter_type: Optional[torch.Tensor] = None,
+        fc_hz: Optional[torch.Tensor] = None,
         decoder_input_ids: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         value_targets: Optional[torch.Tensor] = None,
@@ -101,20 +116,23 @@ class VACTT5(nn.Module):
         valid_mask = valid_vals
         if labels is not None and self.value_token_ids is not None:
             val_ids = self.value_token_ids.to(labels.device)
-            is_val_tok = torch.isin(labels, val_ids)
+            if hasattr(torch, "isin"):
+                is_val_tok = torch.isin(labels, val_ids)
+            else:
+                is_val_tok = (labels.unsqueeze(-1) == val_ids.view(1, 1, -1)).any(-1)
             valid_mask = valid_mask & is_val_tok
         if valid_mask.any():
             slot_type_ids = None
-            if self.slot_type_lookup is not None:
+            if labels is not None and self.slot_type_lookup is not None and self.value_head.slot_type_emb is not None:
                 vocab_size = self.slot_type_lookup.shape[0]
                 safe_labels = torch.where(labels >= 0, labels, torch.zeros_like(labels))
                 safe_labels = torch.clamp(safe_labels, 0, vocab_size - 1)
-                slot_type_ids = torch.gather(self.slot_type_lookup, 0, safe_labels)
+                slot_type_ids = self.slot_type_lookup[safe_labels]
                 slot_type_ids = torch.where(slot_type_ids >= 0, slot_type_ids, torch.zeros_like(slot_type_ids))
             pred = self.value_head(dec_hidden, slot_type_ids=slot_type_ids)
-            mant_loss = F.cross_entropy(pred.mantissa_logits[valid], mant_tgt[valid])
-            dec_loss = F.cross_entropy(pred.decade_logits[valid], dec_tgt[valid])
-            res_loss = F.mse_loss(pred.residual_log10[valid], res_tgt[valid])
+            mant_loss = F.cross_entropy(pred.mantissa_logits[valid_mask], mant_tgt[valid_mask])
+            dec_loss = F.cross_entropy(pred.decade_logits[valid_mask], dec_tgt[valid_mask])
+            res_loss = F.mse_loss(pred.residual_log10[valid_mask], res_tgt[valid_mask])
             value_loss = mant_loss + dec_loss + res_loss
             loss = outputs.loss + self.value_loss_weight * value_loss if outputs.loss is not None else value_loss
             outputs.loss = loss
@@ -128,10 +146,10 @@ class VACTT5(nn.Module):
     def predict_values(
         self,
         wave: torch.Tensor,
-        filter_type: torch.Tensor,
-        fc_hz: torch.Tensor,
-        token_ids: torch.Tensor,
+        filter_type: Optional[torch.Tensor] = None,
+        fc_hz: Optional[torch.Tensor] = None,
         *,
+        token_ids: torch.Tensor,
         mode: str = "precision",
     ) -> torch.Tensor:
         """
@@ -147,10 +165,10 @@ class VACTT5(nn.Module):
         )
         dec_hidden = out.decoder_hidden_states[-1]
         slot_type_ids = None
-        if self.slot_type_lookup is not None:
+        if self.slot_type_lookup is not None and self.value_head.slot_type_emb is not None:
             vocab_size = self.slot_type_lookup.shape[0]
             safe_ids = torch.clamp(token_ids, 0, vocab_size - 1)
-            slot_type_ids = torch.gather(self.slot_type_lookup, 0, safe_ids)
+            slot_type_ids = self.slot_type_lookup[safe_ids]
             slot_type_ids = torch.where(slot_type_ids >= 0, slot_type_ids, torch.zeros_like(slot_type_ids))
         pred = self.value_head(dec_hidden, slot_type_ids=slot_type_ids)
         mant_idx = torch.argmax(pred.mantissa_logits, dim=-1)
@@ -162,8 +180,8 @@ class VACTT5(nn.Module):
     def generate(
         self,
         wave: torch.Tensor,
-        filter_type: torch.Tensor,
-        fc_hz: torch.Tensor,
+        filter_type: Optional[torch.Tensor] = None,
+        fc_hz: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         encoder_outputs = self.encode(wave, filter_type, fc_hz)

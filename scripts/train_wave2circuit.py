@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import inspect
+import json
 import random
 import sys
 from pathlib import Path
@@ -513,7 +515,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--use-wave",
         choices=["ideal", "real", "both", "ideal_s21", "real_s21", "mix"],
-        default="real",
+        default="ideal",
         help="Which waveform to use (S21-only options: ideal_s21 / real_s21).",
     )
     p.add_argument(
@@ -523,12 +525,61 @@ def parse_args() -> argparse.Namespace:
         help="When --use-wave mix, probability of picking real waveform (rest ideal).",
     )
     p.add_argument(
+        "--freq-mode",
+        choices=["none", "log_fc", "linear_fc", "log_f", "log_f_centered"],
+        default="log_f_centered",
+        help=(
+            "Prepend frequency-position channel: "
+            "none (no freq channel), "
+            "log_fc (log10(f/fc)), "
+            "linear_fc (f/fc), "
+            "log_f (log10(f)), "
+            "log_f_centered (log10(f) - mean(log10(f)))."
+        ),
+    )
+    p.add_argument(
+        "--freq-scale",
+        choices=["none", "log_fc", "log_f_mean"],
+        default="log_f_mean",
+        help=(
+            "Optional constant scale channel: "
+            "none, "
+            "log_fc (repeat log10(fc)), "
+            "log_f_mean (repeat mean(log10(f)))."
+        ),
+    )
+    p.add_argument(
+        "--spec-mode",
+        choices=["none", "type_fc"],
+        default="none",
+        help="Spec token usage: none (wave-only) or type_fc (prepend filter type + fc token).",
+    )
+    p.add_argument(
+        "--no-s11",
+        dest="include_s11",
+        action="store_false",
+        help="Drop S11 channels from waveform input.",
+    )
+    p.set_defaults(include_s11=True)
+    p.add_argument(
         "--repr",
-        choices=["vact", "vact_struct", "dsl", "sfci", "action", "vactdsl", "dslv2"],
-        default="vact",
+        choices=["vact", "vact_struct", "dsl", "sfci", "action"],
+        default="dsl",
         help="Which token sequence to train on.",
     )
-    p.add_argument("--grammar-mask", action="store_true", help="Apply FSM grammar mask during training (train/infer aligned).")
+    p.add_argument(
+        "--grammar-mask",
+        dest="grammar_mask",
+        action="store_true",
+        help="Apply FSM grammar mask during training (train/infer aligned).",
+    )
+    p.add_argument(
+        "--no-grammar-mask",
+        dest="grammar_mask",
+        action="store_false",
+        help="Disable FSM grammar mask during training.",
+    )
+    p.set_defaults(grammar_mask=True)
     p.add_argument("--wave-norm", action="store_true", help="Per-channel standardize waveforms for stability.")
     p.add_argument("--num-workers", type=int, default=4, help="Dataloader workers.")
     p.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -557,8 +608,6 @@ def build_value_token_info(tokenizer) -> tuple[list[int], dict[int, int]]:
 
 def main() -> None:
     args = parse_args()
-    repr_alias = {"vactdsl": "vact_struct", "dslv2": "dsl"}
-    args.repr = repr_alias.get(args.repr, args.repr)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -581,6 +630,9 @@ def main() -> None:
         mix_real_prob=args.mix_real_prob,
         use_repr=args.repr,
         normalize_wave=args.wave_norm,
+        freq_mode=args.freq_mode,
+        freq_scale=args.freq_scale,
+        include_s11=args.include_s11,
     )
     eval_ds = None
     if args.eval_data:
@@ -591,6 +643,9 @@ def main() -> None:
             mix_real_prob=args.mix_real_prob,
             use_repr=args.repr,
             normalize_wave=args.wave_norm,
+            freq_mode=args.freq_mode,
+            freq_scale=args.freq_scale,
+            include_s11=args.include_s11,
         )
     collate_fn = make_collate_fn(tokenizer, use_repr=args.repr)
 
@@ -600,6 +655,7 @@ def main() -> None:
         t5_name=args.t5_name,
         waveform_in_channels=in_channels,
         vocab_size=len(tokenizer),
+        spec_mode=args.spec_mode,
         value_loss_weight=args.value_loss_weight,
         value_token_ids=value_token_ids,
         slot_type_token_to_idx=slot_type_map,
@@ -615,7 +671,7 @@ def main() -> None:
         # align save/eval cadence to satisfy load_best_model_at_end requirement
         save_steps = args.eval_steps
 
-    training_args = TrainingArguments(
+    training_kwargs = dict(
         output_dir=str(args.output),
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
@@ -643,6 +699,28 @@ def main() -> None:
         bf16=use_bf16,
         logging_first_step=True,
     )
+    sig = inspect.signature(TrainingArguments.__init__)
+    valid_params = set(sig.parameters)
+    eval_key = None
+    if "evaluation_strategy" in valid_params:
+        eval_key = "evaluation_strategy"
+    elif "eval_strategy" in valid_params:
+        # Newer transformers renamed evaluation_strategy -> eval_strategy.
+        training_kwargs["eval_strategy"] = training_kwargs.pop("evaluation_strategy")
+        eval_key = "eval_strategy"
+    if eval_key is None:
+        if "evaluate_during_training" in valid_params:
+            training_kwargs["evaluate_during_training"] = eval_strategy != "no"
+        if training_kwargs.get("load_best_model_at_end"):
+            print("[warn] TrainingArguments lacks evaluation strategy; disabling load_best_model_at_end.")
+            training_kwargs["load_best_model_at_end"] = False
+            training_kwargs.pop("metric_for_best_model", None)
+            training_kwargs.pop("greater_is_better", None)
+    filtered_kwargs = {k: v for k, v in training_kwargs.items() if k in valid_params}
+    dropped = sorted(set(training_kwargs) - set(filtered_kwargs))
+    if dropped:
+        print(f"[warn] TrainingArguments does not accept {dropped}; dropping for compatibility.")
+    training_args = TrainingArguments(**filtered_kwargs)
 
     trainer = Wave2CircuitTrainer(
         model=model,
@@ -655,6 +733,17 @@ def main() -> None:
 
     trainer.train()
     trainer.save_model(str(args.output))
+    input_cfg = {
+        "freq_mode": args.freq_mode,
+        "freq_scale": args.freq_scale,
+        "include_s11": bool(args.include_s11),
+        "spec_mode": args.spec_mode,
+        "in_channels": int(in_channels),
+    }
+    cfg_path = args.output / "input_config.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    with cfg_path.open("w") as f:
+        json.dump(input_cfg, f, indent=2, sort_keys=True)
     # Save minimal HF-style artifacts for eval/debug.
     model.t5.config.save_pretrained(str(args.output))
     model.t5.generation_config.save_pretrained(str(args.output))
